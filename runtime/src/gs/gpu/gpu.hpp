@@ -16,7 +16,7 @@ struct DisplaySource {
 };
 
 struct SurfaceTarget {
-    enum Kind { X11, Wayland, Canvas, Win32, Metal } kind;
+    enum Kind { X11, Wayland, Canvas, Win32, Metal, Android } kind;  // the same order as ps2::WindowTarget::Kind
     void *display;
     std::uint64_t window;
     void *surface;
@@ -53,6 +53,7 @@ bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, s
 bool attach_surface(const SurfaceTarget &target);
 void resize_surface(std::uint32_t width, std::uint32_t height);
 bool has_surface();
+void detach_surface();  // the window is gone (Android, in the background): let go of its surface
 bool present(const DisplaySource &src);
 std::uint32_t scale();
 void set_scale(std::uint32_t s);

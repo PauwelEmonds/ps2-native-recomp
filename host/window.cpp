@@ -223,6 +223,12 @@ bool attach_gpu() {
         target.surface = info.info.wl.surface;
         break;
 #endif
+#if defined(SDL_VIDEO_DRIVER_ANDROID)
+    case SDL_SYSWM_ANDROID:
+        target.kind = ps2::WindowTarget::Android;
+        target.surface = info.info.android.window;  // ANativeWindow*
+        break;
+#endif
 #if defined(SDL_VIDEO_DRIVER_WINDOWS)
     case SDL_SYSWM_WINDOWS:
         target.kind = ps2::WindowTarget::Win32;
@@ -1327,6 +1333,17 @@ void poll() {
             else if (e.key.keysym.scancode == SDL_SCANCODE_F8) ps2::quick_request(ps2::QuickKey::load);
             else if (e.key.keysym.scancode == SDL_SCANCODE_F9) ps2::quick_request(ps2::QuickKey::report);
         }
+#ifdef __ANDROID__
+        // Android: the app went to the background (another app, the screen turned off) and its window was taken away; it comes
+        // back with a new one. SDL blocks this thread while the app is in the background, so both events usually come together
+        // on the way back. The emulation waits meanwhile: the sound device is paused and sets the pace.
+        if (e.type == SDL_APP_WILLENTERBACKGROUND && g_gpu_present) ps2::detach_window();
+        if (e.type == SDL_APP_DIDENTERFOREGROUND && g_gpu_present) {
+            ps2::detach_window();
+            const bool attached = attach_gpu();
+            std::fprintf(stderr, "[window] back in the foreground: %s\n", attached ? "presenting to the new window" : "the new window takes no WebGPU surface");
+        }
+#endif
         if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED && g_gpu_present) {
             int w = 0, h = 0;
             SDL_GetWindowSizeInPixels(g_window, &w, &h);
@@ -1547,6 +1564,11 @@ void show_speed() {
                   (cpu - cpu_start) / seconds * 100.0, (gpu - gpu_start) / (seconds * 10.0), resident_mb(), queued, stretched);
     g_speed_title = title;
     refresh_title();
+#ifdef __ANDROID__
+    // a phone shows no title bar: the same line goes into the log (logcat, log.txt) every 5 seconds
+    static unsigned every = 0;
+    if (++every % 5 == 0) std::fprintf(stderr, "[speed] %s\n", title);
+#endif
     start = now;
     frames = 0;
     cpu_start = cpu;
@@ -1868,6 +1890,12 @@ bool open_window(bool fullscreen) {
     Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0u);
 #ifdef __APPLE__
     if (!std::getenv("PS2_SDL_RENDERER")) flags |= SDL_WINDOW_METAL;
+#endif
+#ifdef __ANDROID__
+    // Without a graphics API flag SDL puts an OpenGL ES surface on the window, and wgpu's Vulkan surface then cannot have it
+    // (ERROR_NATIVE_WINDOW_IN_USE_KHR). A resizable window would also let SDL turn the screen upright: keep it landscape.
+    if (!std::getenv("PS2_SDL_RENDERER")) flags |= SDL_WINDOW_VULKAN;
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
 #endif
     g_game_title = ps2::os::env("PS2_WINDOW_TITLE");
     const std::string initial_title = g_game_title.empty() ? g_speed_title : g_game_title + "   |   " + g_speed_title;

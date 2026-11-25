@@ -977,8 +977,9 @@ std::string routine_report(const char *prefix) {
     if (!live) return {};
     const std::uint64_t since = g_live_frame.load(std::memory_order_relaxed), frames = frame_count();
     // Read while the emulation may be running: one word each, a hint of where the code is, not an exact place.
-    const std::uint32_t pc = std::atomic_ref<std::uint32_t>(g_cpu.pc).load(std::memory_order_relaxed) & ~kUnwind;
-    const std::uint32_t ra = std::atomic_ref<std::uint32_t>(g_cpu.r[31].w[0]).load(std::memory_order_relaxed);
+    // __atomic_load_n rather than std::atomic_ref: the Android NDK's libc++ (r27) has no atomic_ref yet
+    const std::uint32_t pc = __atomic_load_n(&g_cpu.pc, __ATOMIC_RELAXED) & ~kUnwind;
+    const std::uint32_t ra = __atomic_load_n(&g_cpu.r[31].w[0], __ATOMIC_RELAXED);
     char b[256];
     std::snprintf(b, sizeof b, " at 0x%08X is running since frame %llu (%llu frames ago); pc 0x%08X ra 0x%08X\n",
                   g_live_address.load(std::memory_order_relaxed), static_cast<unsigned long long>(since),

@@ -189,7 +189,16 @@ if(NOT EMSCRIPTEN)
     endif()
 endif()
 
-set(PS2_WGPU_DIR "${CMAKE_SOURCE_DIR}/third_party/wgpu-native" CACHE PATH "wgpu-native release folder")
+if(ANDROID)
+    # one folder per ABI (scripts/fetch_wgpu_android.sh): aarch64 for phones, x86_64 for the emulator
+    string(REPLACE "arm64-v8a" "aarch64" ps2_wgpu_abi "${ANDROID_ABI}")
+    set(PS2_WGPU_DIR "${CMAKE_SOURCE_DIR}/third_party/wgpu-android-${ps2_wgpu_abi}" CACHE PATH "wgpu-native release folder")
+    if(NOT EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
+        message(FATAL_ERROR "wgpu-native for Android ${ANDROID_ABI} is missing in ${PS2_WGPU_DIR}: run scripts/fetch_wgpu_android.sh")
+    endif()
+else()
+    set(PS2_WGPU_DIR "${CMAKE_SOURCE_DIR}/third_party/wgpu-native" CACHE PATH "wgpu-native release folder")
+endif()
 if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
     set(PS2_GS_WGSL "${CMAKE_BINARY_DIR}/gs_wgsl.cpp")
     add_custom_command(OUTPUT "${PS2_GS_WGSL}"
@@ -230,6 +239,9 @@ if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
         endif()
         if(WIN32)
             target_link_libraries(ps2runtime ${PS2_API} "${PS2_WGPU_DIR}/lib/libwgpu_native.a" ws2_32 userenv ntdll synchronization pthread m)
+        elseif(ANDROID)
+            # bionic has the threads in libc (no libpthread); wgpu's Vulkan surface takes an ANativeWindow (libandroid), its log libandroid's log
+            target_link_libraries(ps2runtime ${PS2_API} "${PS2_WGPU_DIR}/lib/libwgpu_native.a" dl m android log)
         else()
             target_link_libraries(ps2runtime ${PS2_API} "${PS2_WGPU_DIR}/lib/libwgpu_native.a" dl pthread m)
         endif()
@@ -598,6 +610,12 @@ if(PS2_GENERATED)
             -sEXPORTED_RUNTIME_METHODS=callMain,addRunDependency,removeRunDependency,HEAPU8,ENV
             --shell-file ${CMAKE_SOURCE_DIR}/web/shell.html --preload-file ${PS2_WEB_ELF}@/game/core.elf)
         set_target_properties(ps2web PROPERTIES SUFFIX ".html" LINK_DEPENDS ${CMAKE_SOURCE_DIR}/web/shell.html)
+        return()
+    endif()
+
+    if(ANDROID)
+        # the Android app (android/, docs/android.md): libmain.so with SDL2 instead of the ps2run program
+        include("${CMAKE_SOURCE_DIR}/cmake/android.cmake")
         return()
     endif()
 

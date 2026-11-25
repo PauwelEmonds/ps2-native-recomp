@@ -25,6 +25,7 @@
 #include <ctime>
 #include <cwchar>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <stdexcept>
 #include <string_view>
@@ -85,6 +86,27 @@ std::filesystem::path find_game_dir(const std::string &program_location, const s
     for (const auto &place : places)
         if (std::filesystem::is_directory(place / "vu1", error) || std::filesystem::is_regular_file(place / "entries.txt", error)) return place;
     return {};
+}
+
+// <game folder>/env.txt: PS2_ switches a game always needs, one NAME=value a line (# starts a comment), for example a compiled
+// vector program that must run in the interpreter. A variable the user set already wins. The Android app bakes the same file
+// into the APK (android/app/build.gradle, GameActivity).
+void apply_game_env(const std::filesystem::path &dir) {
+    if (dir.empty()) return;
+    std::ifstream in(dir / "env.txt");
+    std::string line;
+    while (in && std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const std::size_t eq = line.find('=');
+        if (line.empty() || line[0] == '#' || eq == std::string::npos || line.rfind("PS2_", 0) != 0) continue;
+        const std::string name = line.substr(0, eq), value = line.substr(eq + 1);
+        if (!ps2::os::env(name.c_str()).empty()) {
+            std::fprintf(stderr, "[env] %s of the game's env.txt is not used: it is set already\n", name.c_str());
+            continue;
+        }
+        ps2::os::set_env(name.c_str(), value);
+        std::fprintf(stderr, "[env] %s=%s (the game's env.txt)\n", name.c_str(), value.c_str());
+    }
 }
 
 // --language: a two-letter code or the console's own number (1 to 7); 0 for anything else
@@ -860,6 +882,7 @@ int main(int argc, char **argv) {
     }
     game_dir = game_dir.lexically_normal();
     ps2::g_options.game_dir = ps2::os::utf8(game_dir);
+    apply_game_env(game_dir);
     const std::filesystem::path data_dir = game_dir.empty() ? program_file.parent_path() : game_dir;
 
 #ifdef PS2_WINDOW

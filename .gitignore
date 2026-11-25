@@ -75,3 +75,4 @@ __pycache__/
 
 # Games packed into one file (scripts/extract_disc.py bundle).
 /dist/
+/third_party/wgpu-android-*/

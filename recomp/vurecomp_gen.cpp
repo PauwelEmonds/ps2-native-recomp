@@ -725,10 +725,22 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
             bool out = false;
             for (std::int64_t s : successors(pc)) out = out || s < 0 || !in.count(static_cast<std::uint32_t>(s)) || live_in[static_cast<std::uint32_t>(s)];
             const std::uint32_t hi = word(p.code, pc + 4);
+            // A reader in the next three pairs still sees the flags of before this site. "Next" follows the program: a branch in
+            // the pair before this one sends it on to the target after the delay slot (successors()), so the pairs are walked
+            // along every way and not along the addresses (Tony Hawk's Pro Skater 4: B to an FMAND at 0x22A0 from the delay slot
+            // at 0x2248; looking at 0x2250-0x2260 instead marked the MSUB at 0x2238, which that FMAND reads, as never read).
             bool reader_near = false;
-            for (std::uint32_t k = 1; k <= 3; ++k) {
-                const std::uint32_t q = (pc + 8u * k) & kMask;
-                if (in.count(q) && (lowers[q].reads_flags || lowers[q].branch || lowers[q].jump)) reader_near = true;
+            std::vector<std::uint32_t> step{pc};
+            for (std::uint32_t k = 1; k <= 3 && !reader_near; ++k) {
+                std::vector<std::uint32_t> next;
+                for (std::uint32_t from : step)
+                    for (std::int64_t s : successors(from)) {
+                        if (s < 0 || !in.count(static_cast<std::uint32_t>(s))) continue;
+                        const std::uint32_t q = static_cast<std::uint32_t>(s);
+                        if (lowers[q].reads_flags || lowers[q].branch || lowers[q].jump) reader_near = true;
+                        next.push_back(q);
+                    }
+                step = std::move(next);
             }
             const bool kills = upper_sets_flags(hi) && !reader_near;
             const bool v = lowers[pc].reads_flags || (!kills && out);

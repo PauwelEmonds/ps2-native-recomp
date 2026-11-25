@@ -52,6 +52,8 @@ void state(ps2::state::Stream &s);
 void reset();
 void write(std::uint32_t reg, std::uint64_t value);
 void signal(std::uint32_t reg, std::uint64_t value);
+// A SIGNAL, FINISH or LABEL write that arrives late (gif::take_vu_signals): given to signal() in order, a SIGNAL only once CSR.SIGNAL is clear
+void queue_signal(std::uint32_t reg, std::uint64_t value);
 void raise_finish();
 void note_transfer(std::uint32_t reg, std::uint64_t value);
 void write_packed(std::uint32_t reg, const Reg128 &q);
@@ -106,6 +108,7 @@ bool copy_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uin
 bool copy_frame(const DisplayRegs &regs, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
 bool attach_window(int kind, void *display, std::uint64_t window, void *surface, const char *selector, std::uint32_t width, std::uint32_t height);
 void resize_window(std::uint32_t width, std::uint32_t height);
+void detach_window();
 bool present();
 bool present(const DisplayRegs &regs);
 void start_thread();

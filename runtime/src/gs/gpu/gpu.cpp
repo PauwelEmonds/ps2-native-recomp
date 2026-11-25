@@ -3999,7 +3999,8 @@ static bool open_backend([[maybe_unused]] std::uint32_t backends, const char *na
     WGPUDeviceDescriptor dd = WGPU_DEVICE_DESCRIPTOR_INIT;
     dd.requiredLimits = &limits;
     WGPUFeatureName features[2];
-    g_timestamps = wgpuAdapterHasFeature(adapter, WGPUFeatureName_TimestampQuery);
+    // PS2_GPU_TIMESTAMPS=0: no timing queries (the GPU % of the title bar), for drivers that offer them but fail on them
+    g_timestamps = wgpuAdapterHasFeature(adapter, WGPUFeatureName_TimestampQuery) && os::env("PS2_GPU_TIMESTAMPS") != "0";
     if (g_timestamps) features[dd.requiredFeatureCount++] = WGPUFeatureName_TimestampQuery;
     if (hw::enabled() && wgpuAdapterHasFeature(adapter, WGPUFeatureName_DualSourceBlending)) features[dd.requiredFeatureCount++] = WGPUFeatureName_DualSourceBlending;  // stored alpha in one draw; asked for only when the card path is on and the adapter offers it
     dd.requiredFeatures = features;
@@ -5029,6 +5030,12 @@ bool attach_surface(const SurfaceTarget &target) {
     WGPUSurfaceSourceMetalLayer metal = WGPU_SURFACE_SOURCE_METAL_LAYER_INIT;
     metal.layer = target.surface;
     sd.nextInChain = &metal.chain;
+#elif defined(__ANDROID__)
+    // the ANativeWindow of SDL's surface view (host/window.cpp); wgpu draws to it with Vulkan
+    if (target.kind != SurfaceTarget::Android || !target.surface) return false;
+    WGPUSurfaceSourceAndroidNativeWindow android_window = WGPU_SURFACE_SOURCE_ANDROID_NATIVE_WINDOW_INIT;
+    android_window.window = target.surface;
+    sd.nextInChain = &android_window.chain;
 #else
     WGPUSurfaceSourceXlibWindow xlib = WGPU_SURFACE_SOURCE_XLIB_WINDOW_INIT;
     WGPUSurfaceSourceWaylandSurface wayland = WGPU_SURFACE_SOURCE_WAYLAND_SURFACE_INIT;
@@ -5183,6 +5190,16 @@ void resize_surface(std::uint32_t width, std::uint32_t height) {
 }
 
 bool has_surface() { return g_surface != nullptr; }
+
+// Android takes the window away when the app goes to the background and gives it a new one when it comes back
+// (host/window.cpp): the surface of the old window is let go here, and attach_surface makes one for the new window.
+void detach_surface() {
+    if (!g_surface) return;
+    post::drain();  // no picture of the submit thread still on its way to the old window
+    wgpuSurfaceUnconfigure(g_surface);
+    wgpuSurfaceRelease(g_surface);
+    g_surface = nullptr;
+}
 
 // PS2_PRESENT_LOG=1: once a second, where the window thread spent its time handing pictures to the screen (milliseconds per picture).
 // "acquire" is the wait for the next picture of the swap chain: it is long when the graphics chip is still busy with the earlier ones.

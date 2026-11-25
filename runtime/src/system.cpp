@@ -298,8 +298,16 @@ void report_load() {
     last_frame = g_frames;
 }
 
+void sync_vu_thread();
+
 void vblank() {
     ++g_frames;
+    // VU1 on its own thread: the SIGNAL, FINISH and LABEL writes of the packets it kicked (PATH1) reach the GS here, once a picture,
+    // after the emulation waited for the vector thread to finish what it was given; the same point in every run (gif::take_vu_signals).
+    if (gs::queue::vu_active() && gs::queue::role() == gs::queue::Role::Emulation) {
+        sync_vu_thread();
+        gif::take_vu_signals();
+    }
     crash::test_poll(crash::Thread::Game);
     // Offline EE cache preparation: capture only explicitly requested frames.
     // Disabled for normal runs; the filenames retain the frame and address so
@@ -937,6 +945,7 @@ int run() {
 bool display_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) { return gs::display(rgba, width, height); }
 bool attach_window(const WindowTarget &t) { return gs::attach_window(static_cast<int>(t.kind), t.display, t.window, t.surface, t.selector, t.width, t.height); }
 void resize_window(std::uint32_t width, std::uint32_t height) { gs::resize_window(width, height); }
+void detach_window() { gs::detach_window(); }
 bool present_frame() { return gs::present(); }
 void init_graphics() { gs::init(); }
 void start_render_thread() { gs::start_thread(); }

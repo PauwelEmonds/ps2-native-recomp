@@ -18,6 +18,9 @@ void end_runaway_kick(std::uint32_t address);
 void render(int path, const std::uint8_t *data, std::uint32_t qwc);
 void render_reset();
 void scan_signals(int path, const std::uint8_t *data, std::uint32_t qwc);
+// The SIGNAL, FINISH and LABEL writes the vector thread found in PATH1 since the last call, handed to the GS in order
+// (gs::queue_signal). The emulation thread calls it after it waited for the vector thread.
+void take_vu_signals();
 bool busy(int path);
 std::uint32_t read(std::uint32_t a);
 void write(std::uint32_t a, std::uint32_t v);

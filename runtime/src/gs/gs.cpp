@@ -15,6 +15,7 @@
 #include "ps2/state.hpp"
 #include "ps2/system.hpp"
 
+#include <deque>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -50,6 +51,7 @@ std::uint64_t g_pmode, g_smode1, g_smode2, g_srfsh, g_synch1, g_synch2, g_syncv;
 std::uint64_t g_dispfb[2], g_display[2], g_extbuf, g_extdata, g_extwrite, g_bgcolor;
 std::uint64_t g_csr = 0x551B4000ull, g_imr = 0x7F00ull, g_busdir, g_siglblid;
 std::uint32_t g_finish_pending = 0;  // FINISH events that arrived while CSR.FINISH was still set; raised as the game clears the bit
+std::deque<std::pair<std::uint32_t, std::uint64_t>> g_signal_queue;  // late SIGNAL, FINISH and LABEL writes (queue_signal)
 std::uint32_t g_finish_queued = 0;   // FINISH writes that came while an earlier one was still on its way; each gets its own event (not in a state)
 std::uint64_t g_primitives = 0;
 constexpr std::uint64_t kFinishDelay = 1000; // EE cycles from the FINISH write to CSR.FINISH
@@ -587,6 +589,7 @@ void reset() {
     g_imr = 0x7F00ull;
     g_finish_pending = 0;
     g_finish_queued = 0;
+    g_signal_queue.clear();
     if (queue::active()) queue::post(queue::kReset, 0, 0, nullptr, 0);
     else render_reset();
 }
@@ -959,6 +962,24 @@ void signal(std::uint32_t reg, std::uint64_t value) {
     }
     default: break;
     }
+}
+
+// SIGNAL, FINISH and LABEL writes that reach the emulation thread late, in a batch (gif::take_vu_signals: the ones of PATH1 while VU1
+// has its own thread). They go to signal() in order; a SIGNAL waits while CSR.SIGNAL is still set from the one before, as the GS
+// stops at such a SIGNAL until the game clears the bit, so the game's handler runs once for every one.
+
+static void deliver_signals() {
+    while (!g_signal_queue.empty()) {
+        const auto [reg, value] = g_signal_queue.front();
+        if (reg == 0x60 && (g_csr & 1u)) return;
+        g_signal_queue.pop_front();
+        signal(reg, value);
+    }
+}
+
+void queue_signal(std::uint32_t reg, std::uint64_t value) {
+    g_signal_queue.emplace_back(reg, value);
+    deliver_signals();
 }
 
 static void write_packed_generic(std::uint32_t reg, const Reg128 &q);
@@ -1542,11 +1563,13 @@ void write_privileged(std::uint32_t address, std::uint64_t value) {
         if (trace_finish()) std::fprintf(stderr, "[gs] CSR write %llX f%llu csr %llX pending %u\n", static_cast<unsigned long long>(value),
                                          static_cast<unsigned long long>(frame_count()), static_cast<unsigned long long>(g_csr), g_finish_pending);
         g_csr &= ~(value & 0x1Fu);
+        if ((value & 1u) && !g_signal_queue.empty()) deliver_signals();
         if ((value & 2u) && g_finish_pending) {
             --g_finish_pending;
             raise(2);
         }
         if (value & 0x200u) {
+            g_signal_queue.clear();
             g_finish_pending = 0;
             g_finish_queued = 0;
             g_csr = 0x551B4000ull;
@@ -1596,6 +1619,12 @@ void resize_window(std::uint32_t width, std::uint32_t height) {
     gpu::resize_surface(width, height);
 #else
     (void)width, (void)height;
+#endif
+}
+
+void detach_window() {
+#ifdef PS2_GPU
+    if (gpu::mode() == gpu::Mode::primary) gpu::detach_surface();
 #endif
 }
 

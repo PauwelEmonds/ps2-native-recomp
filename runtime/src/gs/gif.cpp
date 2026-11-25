@@ -11,6 +11,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <utility>
 #include <vector>
 
 namespace ps2::gif {
@@ -179,7 +181,9 @@ struct GsSink {
     void image(const std::uint8_t *data, std::uint32_t qwords) { gs::write_image(data, qwords); }
 };
 
-void scan(Path &p, const std::uint8_t *data, std::uint32_t qwc) {
+// `found` set: the SIGNAL, FINISH and LABEL writes are noted there instead of going to the GS registers at once (the vector thread's
+// PATH1 scan, take_vu_signals), and the transfer registers are left alone.
+void scan(Path &p, const std::uint8_t *data, std::uint32_t qwc, std::vector<std::pair<std::uint32_t, std::uint64_t>> *found = nullptr) {
     std::uint32_t i = 0;
     while (i < qwc) {
         Reg128 q;
@@ -205,7 +209,9 @@ void scan(Path &p, const std::uint8_t *data, std::uint32_t qwc) {
                 if (((p.regs >> (p.reg * 4)) & 0xFu) == 0xEu && at[8] >= 0x50 && at[8] <= 0x62) {
                     std::uint64_t value;
                     std::memcpy(&value, at, 8);
-                    if (at[8] >= 0x60) gs::signal(at[8], value);
+                    if (found) {
+                        if (at[8] >= 0x60) found->emplace_back(at[8], value);
+                    } else if (at[8] >= 0x60) gs::signal(at[8], value);
                     else if (at[8] <= 0x53) gs::note_transfer(at[8], value);
                 }
                 if (++p.reg >= p.nreg) {
@@ -238,6 +244,15 @@ void scan(Path &p, const std::uint8_t *data, std::uint32_t qwc) {
 }
 
 Path g_scan[4];
+
+// PATH1 with VU1 on its own thread. The emulation thread follows VIF1 dry (vif.cpp) and so sees the SIGNAL, FINISH and LABEL
+// writes of PATH2 (scan_signals), but not those in the packets VU1 programs kick: it does not run the programs. The vector thread
+// looks for them in what it kicks and leaves them here; the emulation thread takes them over after it waited for the vector thread
+// (take_vu_signals), at a point of its own choosing, so a run gives the game the same writes at the same moment every time. Tony
+// Hawk's Pro Skater 4 waits on its loading screen for SIGNAL interrupts from PATH1; without this they never came.
+Path g_vu_scan1;  // the vector thread's own
+std::mutex g_vu_found_mutex;
+std::vector<std::pair<std::uint32_t, std::uint64_t>> g_vu_found;
 
 // PATH3 under VIF1's MSKPATH3: while the mask is up a real GIF leaves channel 2's data
 // waiting, and a mask that comes up while a packet is under way stops PATH3 at the packet's
@@ -273,6 +288,14 @@ void out(int path, const std::uint8_t *data, std::uint32_t qwc) {
         return;
     }
     if (gs::queue::role() != gs::queue::Role::Vu) scan(g_scan[path], data, qwc);
+    else if (path == 1) {
+        std::vector<std::pair<std::uint32_t, std::uint64_t>> found;
+        scan(g_vu_scan1, data, qwc, &found);
+        if (!found.empty()) {
+            std::lock_guard<std::mutex> lock(g_vu_found_mutex);
+            g_vu_found.insert(g_vu_found.end(), found.begin(), found.end());
+        }
+    }
     gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(path), qwc, data, qwc * 16);
 }
 
@@ -381,6 +404,7 @@ void end_runaway_kick(std::uint32_t address) {
         return;
     }
     if (gs::queue::role() != gs::queue::Role::Vu) g_scan[1].active = false;
+    else g_vu_scan1.active = false;
     gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(1 | kEndPacket), address, nullptr, 0);
 }
 
@@ -434,6 +458,15 @@ void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
 }
 
 void scan_signals(int path, const std::uint8_t *data, std::uint32_t qwc) { scan(g_scan[path], data, qwc); }
+
+void take_vu_signals() {
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> found;
+    {
+        std::lock_guard<std::mutex> lock(g_vu_found_mutex);
+        found.swap(g_vu_found);
+    }
+    for (const auto &[reg, value] : found) gs::queue_signal(reg, value);
+}
 
 bool busy(int path) { return g_paths[path].active; }
 

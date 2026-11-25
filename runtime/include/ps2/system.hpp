@@ -130,7 +130,7 @@ std::uint64_t frame_count();
 bool display_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
 
 struct WindowTarget {
-    enum Kind { X11, Wayland, Canvas, Win32, Metal } kind = X11;
+    enum Kind { X11, Wayland, Canvas, Win32, Metal, Android } kind = X11;  // Android: surface is the ANativeWindow
     void *display = nullptr;
     std::uint64_t window = 0;
     void *surface = nullptr;
@@ -141,6 +141,7 @@ struct WindowTarget {
 // Lets the WebGPU renderer present straight to a window or canvas instead of handing frames back.
 bool attach_window(const WindowTarget &target);
 void resize_window(std::uint32_t width, std::uint32_t height);
+void detach_window();  // the window went away (Android in the background); attach_window gives the new one
 bool present_frame();
 void init_graphics();
 void start_render_thread();

@@ -1,0 +1,76 @@
+plugins {
+    id 'com.android.application'
+}
+
+// Which game: the C++ that scripts/port.sh wrote into generated/<name>. The APK holds that translated code, so it is a build
+// of a game you own for your own phone, the same as build/native-<name>/ps2run on the PC: do not share it.
+//   gradlew assembleRelease -Pps2Game=thps4 -Pps2Title="THPS4" [-Pps2Abis=arm64-v8a,x86_64]
+def game = project.findProperty('ps2Game') ?: 'thps4'
+def title = project.findProperty('ps2Title') ?: game.toUpperCase()
+def abis = (project.findProperty('ps2Abis') ?: 'arm64-v8a').tokenize(',')   // x86_64: the Android emulator on a PC
+def generated = file("../../generated/${game}")
+if (!generated.isDirectory()) {
+    throw new GradleException("no translated game in ${generated}: run  bash scripts/port.sh ${game} <disc image> --native-only  first")
+}
+// the PS2_ switches the game always needs (games/<name>/env.txt, which ps2run reads on the PC): GameActivity sets them
+def envFile = file("../../games/${game}/env.txt")
+def gameEnv = envFile.isFile() ? envFile.readLines().collect { it.trim() }.findAll { it.startsWith('PS2_') && it.contains('=') }.join('\n') : ''
+
+android {
+    namespace 'ps2native.app'
+    compileSdk 35
+    ndkVersion '27.2.12479018'
+
+    defaultConfig {
+        applicationId "ps2native.${game.toLowerCase().replaceAll('[^a-z0-9_]', '_')}"
+        minSdk 28                   // Android 9: Vulkan 1.1 phones, and posix_spawn for the runtime (live_build.cpp)
+        targetSdk 35
+        versionCode 1
+        versionName '0.1'
+        resValue 'string', 'app_name', title
+        buildConfigField 'String', 'GAME', "\"${game}\""
+        buildConfigField 'String', 'GAME_ENV', "\"${gameEnv.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')}\""
+        ndk {
+            abiFilters(*abis)
+        }
+        externalNativeBuild {
+            cmake {
+                // the game is always built optimised, also in a debug APK: at -O0 it would be far too slow to play
+                arguments "-DPS2_GENERATED=${generated.absolutePath.replace('\\', '/')}", '-DCMAKE_BUILD_TYPE=Release',
+                          '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON'     // 16 KB pages (Android 15 devices)
+                // ARM always has FMA: without this the compiler fuses multiply and add, which changes the vector units'
+                // results (scripts/cxx.sh, "AVX2 is a build flag")
+                cppFlags '-ffp-contract=off'
+                targets 'main', 'SDL2'
+            }
+        }
+    }
+    buildFeatures {
+        buildConfig true
+    }
+    externalNativeBuild {
+        cmake {
+            path '../../CMakeLists.txt'
+            version '3.22.1'
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            // signed with the debug key unless -Pps2Keystore=... -Pps2KeyAlias=... -Pps2KeyPassword=... is given: fine for
+            // installing it on your own phone
+            signingConfig project.hasProperty('ps2Keystore') ? signingConfigs.create('ps2') {
+                storeFile file(project.ps2Keystore); storePassword project.ps2KeyPassword
+                keyAlias project.ps2KeyAlias; keyPassword project.ps2KeyPassword
+            } : signingConfigs.debug
+        }
+    }
+    packaging {
+        jniLibs {
+            useLegacyPackaging true   // the libraries unpacked on install: libmain.so is large and starts faster from a file
+        }
+    }
+    lint {
+        abortOnError false
+    }
+}

@@ -1,0 +1,4 @@
+// The Android app: a game that scripts/port.sh translated, as an APK (docs/android.md).
+plugins {
+    id 'com.android.application' version '8.13.0' apply false
+}

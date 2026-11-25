@@ -97,6 +97,9 @@ void read_q(const Unit &u, vuops::FlagPipe &pipe, Vu0Regs &r, std::uint32_t pc, 
 
 std::uint64_t g_reported = 0;
 bool g_reference_dry = false;
+std::vector<std::pair<std::uint32_t, std::uint64_t>> *g_kick_capture = nullptr;  // PS2_VU_CHECK_KEY (run_entry)
+std::int64_t g_stop_pc = -1;        // PS2_VU_CHECK_KEY: the interpreter (run_fast) stops when it gets to this address
+std::int64_t g_chained_check = -1;  // PS2_VU_CHECK_KEY: where the checked program handed over
 
 Unit unit_of(int n) {
     if (n == 0) return Unit{&g_cpu.vu0, g_vu0_code, g_vu0_mem, 4095u, 256u, g_cpu.vu0.tpc};
@@ -526,6 +529,11 @@ __attribute__((noinline)) void xgkick_wrapped(Unit &u, std::uint32_t first, std:
 // The packet is only measured here (one 8-byte read per GIF tag); the bytes are handed over where they lie in the data memory,
 // which gif::transfer copies before it returns, so nothing is copied twice and no 16 KiB buffer is set up for each kick.
 void xgkick(Unit &u, std::uint32_t address) {
+    if (g_kick_capture) {  // PS2_VU_CHECK_KEY: each kick as (address, hash of the data memory at that moment)
+        std::uint64_t h = 0xCBF29CE484222325ull;
+        for (std::uint32_t i = 0; i < u.data_qwords * 16; ++i) h = (h ^ u.data[i]) * 0x100000001B3ull;
+        g_kick_capture->push_back({address & (u.data_qwords - 1), h});
+    }
     if (g_reference_dry) return;
     const std::uint32_t qwords = u.data_qwords, first = address & (qwords - 1);
     std::uint32_t q = first, count = 0;
@@ -1006,8 +1014,40 @@ void code_changed(int unit) {
 }
 
 void register_programs(const Program *programs, std::uint32_t count) {
-    for (std::uint32_t i = 0; i < count; ++i)
-        if (programs[i].function) (programs[i].unit == 0 ? g_vu0_programs : g_programs)[programs[i].key] = programs[i].function;
+    // PS2_VU1_KEEP=<first>-<last>: only the compiled VU1 programs with these numbers (in the order of the build, from 0) are used, the
+    // others run in the interpreter. Halving the range finds a compiled program that the game notices behaves otherwise than the
+    // interpreter, also when PS2_VU_CHECK sees no difference in registers and memory (what it sends to the GS, its timing).
+    // PS2_VU1_INTERPRET_KEYS=<key>[,<key>...] (16 hex digits each, as the log lines below print them): these compiled VU1 programs
+    // run in the interpreter, the others stay compiled. For a program that a game is known to trip over, in the game's env.txt.
+    std::uint32_t keep_from = 0, keep_to = ~0u, vu1_number = 0;
+    const char *keep = std::getenv("PS2_VU1_KEEP");
+    if (keep && std::sscanf(keep, "%u-%u", &keep_from, &keep_to) != 2) keep_from = 0, keep_to = ~0u;
+    std::vector<std::uint64_t> interpret_keys;
+    if (const char *keys = std::getenv("PS2_VU1_INTERPRET_KEYS"))
+        for (const char *p = keys; *p;) {
+            char *end = nullptr;
+            const unsigned long long key = std::strtoull(p, &end, 16);
+            if (end == p) { ++p; continue; }
+            interpret_keys.push_back(key);
+            p = end;
+        }
+    for (std::uint32_t i = 0; i < count; ++i) {
+        if (!programs[i].function) continue;
+        if (programs[i].unit == 0) {
+            g_vu0_programs[programs[i].key] = programs[i].function;
+            continue;
+        }
+        const std::uint32_t number = vu1_number++;
+        if (std::find(interpret_keys.begin(), interpret_keys.end(), programs[i].key) != interpret_keys.end()) {
+            std::fprintf(stderr, "[vu] PS2_VU1_INTERPRET_KEYS: VU1 program %016llX runs in the interpreter\n", static_cast<unsigned long long>(programs[i].key));
+            continue;
+        }
+        if (number < keep_from || number > keep_to) {
+            std::fprintf(stderr, "[vu] PS2_VU1_KEEP: VU1 program %u (key %016llX) runs in the interpreter\n", number, static_cast<unsigned long long>(programs[i].key));
+            continue;
+        }
+        g_programs[programs[i].key] = programs[i].function;
+    }
     for (Vu0Entry &entry : g_vu0_entries) entry.generation = 0;
     // The log head says how many programs of each vector unit the build holds (the old line "[vu1] Statically registered N compiled
     // vector programs" counted both: N is the sum of the two numbers). Printed for 0 and 0 too (a build without any: register_generated_vu below).
@@ -1165,7 +1205,7 @@ void interpret(int unit, std::uint32_t pc) {
     // The plain case (no checking, timing, counting or tracing switch, no JIT) goes straight to the program the entry cache already knows:
     // what run_entry and lookup would do for it, without their set-up. Anything else (a new program, a changed code memory, a program
     // that is not compiled) takes the long way.
-    static const bool plain = std::getenv("PS2_VU_INTERPRET") == nullptr && std::getenv("PS2_VU_COUNT") == nullptr && std::getenv("PS2_VU_CHECK") == nullptr &&
+    static const bool plain = std::getenv("PS2_VU_INTERPRET") == nullptr && std::getenv("PS2_VU_COUNT") == nullptr && std::getenv("PS2_VU_CHECK") == nullptr && std::getenv("PS2_VU_CHECK_KEY") == nullptr &&
                               std::getenv("PS2_VU_TIME") == nullptr && std::getenv("PS2_TRACE_VU1RUN") == nullptr && jit::mode() == 0;
     for (;;) {
         if (plain && !live::ready()) {
@@ -1246,6 +1286,116 @@ void time_note(std::uint64_t key, std::uint64_t ticks) {
     row.ticks += ticks;
 }
 
+// PS2_VU_CHECK_KEY=<key> (or all): every call of that one compiled VU1 program (or of all of them) is checked against the interpreter (PS2_VU_CHECK samples one
+// call in 64 of all programs and leaves out calls that escape to the interpreter): registers, flags, TPC, data memory and the
+// kicks (where, and the data memory at that moment). The compiled program's results are what the game gets. A call that hands
+// over (a JR, a pair outside the program) is compared with the interpreter stopped the first time it gets to that address; when
+// the program passes that address before it jumps there (a subroutine that returns to it) the line is a false alarm.
+// Found the flag-liveness bug of vurecomp_gen.cpp in Tony Hawk's Pro Skater 4 (an FMAND reached through a branch).
+void check_every_call(ProgramFn fn, std::uint32_t pc, std::uint64_t key) {
+    (void)key;
+    static std::uint64_t calls = 0, escapes = 0, mismatches = 0;
+    static std::uint8_t before_mem[16384], ref_mem[16384];
+    const Vu0Regs before = g_vu1;
+    std::memcpy(before_mem, g_vu1_mem, sizeof before_mem);
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> ref_kicks, kicks;
+    // 1. the compiled program, dry (its kicks are noted, not sent): where it hands over, if it does
+    std::int64_t escape = -1;
+    g_kick_capture = &kicks;
+    g_reference_dry = true;
+    g_capture = &escape;
+    fn(g_vu1, g_vu1_mem);
+    g_capture = nullptr;
+    g_reference_dry = false;
+    g_kick_capture = nullptr;
+    g_vu1 = before;
+    std::memcpy(g_vu1_mem, before_mem, sizeof before_mem);
+    // 2. the interpreter from the same state, up to the same place
+    g_kick_capture = &ref_kicks;
+    g_reference_dry = true;
+    g_stop_pc = escape;
+    run_fast(1, pc);
+    g_stop_pc = -1;
+    g_reference_dry = false;
+    g_kick_capture = nullptr;
+    const Vu0Regs ref = g_vu1;
+    std::memcpy(ref_mem, g_vu1_mem, sizeof ref_mem);
+    g_vu1 = before;
+    std::memcpy(g_vu1_mem, before_mem, sizeof before_mem);
+    // 3. the compiled program for real; the chain goes on where it hands over (at the end)
+    g_capture = &escape;
+    fn(g_vu1, g_vu1_mem);
+    g_capture = nullptr;
+    ++calls;
+    if (escape >= 0) {
+        ++escapes;
+        g_chained_check = escape;
+    }
+    const bool regs_differ = std::memcmp(&ref, &g_vu1, sizeof ref) != 0, mem_differs = std::memcmp(ref_mem, g_vu1_mem, sizeof ref_mem) != 0;
+    if (regs_differ || mem_differs || kicks != ref_kicks) {
+        if (++mismatches <= 30) {
+            std::string what;
+            char b[160];
+            for (int i = 0; i < 32; ++i)
+                if (std::memcmp(&ref.vf[i], &g_vu1.vf[i], 16) != 0) {
+                    std::snprintf(b, sizeof b, " vf%d", i);
+                    what += b;
+                }
+            if (std::memcmp(&ref.acc, &g_vu1.acc, 16) != 0) what += " acc";
+            for (int i = 0; i < 16; ++i)
+                if (ref.vi[i] != g_vu1.vi[i]) {
+                    std::snprintf(b, sizeof b, " vi%d %04X/%04X", i, ref.vi[i], g_vu1.vi[i]);
+                    what += b;
+                }
+            const auto field = [&](const char *name, std::uint32_t a, std::uint32_t c) {
+                if (a != c) {
+                    std::snprintf(b, sizeof b, " %s %X/%X", name, a, c);
+                    what += b;
+                }
+            };
+            field("q", ref.q, g_vu1.q);
+            field("p", ref.p, g_vu1.p);
+            field("i", ref.i, g_vu1.i);
+            field("r", ref.r, g_vu1.r);
+            field("mac", ref.mac, g_vu1.mac);
+            field("status", ref.status, g_vu1.status);
+            field("clip", ref.clip, g_vu1.clip);
+            field("tpc", ref.tpc, g_vu1.tpc);
+            if (mem_differs) {
+                int first = -1, n = 0;
+                for (int i = 0; i < 16384; ++i)
+                    if (ref_mem[i] != g_vu1_mem[i]) {
+                        if (first < 0) first = i;
+                        ++n;
+                    }
+                std::snprintf(b, sizeof b, " mem: %d bytes from qword 0x%03X", n, first / 16);
+                what += b;
+            }
+            if (kicks != ref_kicks) {
+                std::snprintf(b, sizeof b, " kicks %zu/%zu:", ref_kicks.size(), kicks.size());
+                what += b;
+                for (std::size_t i = 0; i < std::max(kicks.size(), ref_kicks.size()) && i < 6; ++i) {
+                    std::snprintf(b, sizeof b, " %03X%s/%03X%s", i < ref_kicks.size() ? ref_kicks[i].first : 0xFFFu,
+                                  i < ref_kicks.size() && i < kicks.size() && ref_kicks[i].second != kicks[i].second ? "*" : "",
+                                  i < kicks.size() ? kicks[i].first : 0xFFFu, "");
+                    what += b;
+                }
+            }
+            std::fprintf(stderr, "[vu-check-key] %016llX entry %04X call %llu (escape %lld) f%llu: interpreter/compiled differ:%s\n", static_cast<unsigned long long>(g_entries[pc >> 3].key), pc,
+                         static_cast<unsigned long long>(calls), static_cast<long long>(escape), static_cast<unsigned long long>(frame_count()), what.c_str());
+        }
+    }
+    if (calls % 20000 == 0)
+        std::fprintf(stderr, "[vu-check-key] %llu calls, %llu escapes, %llu differ\n", static_cast<unsigned long long>(calls), static_cast<unsigned long long>(escapes),
+                     static_cast<unsigned long long>(mismatches));
+    if (g_chained_check >= 0) {
+        const std::int64_t next = g_chained_check;
+        g_chained_check = -1;
+        g_vu1_entry = static_cast<std::uint32_t>(next) & 16383u;
+        interpret(1, static_cast<std::uint32_t>(next));
+    }
+}
+
 void run_entry(int unit, std::uint32_t pc) {
     if (unit == 1) g_trace_vu1_pc = pc;
     if (unit == 1) { static const bool log_runs = std::getenv("PS2_TRACE_VU1RUN") != nullptr; if (log_runs) std::fprintf(stderr, "[vu1-run] pc %X\n", pc); }
@@ -1262,6 +1412,14 @@ void run_entry(int unit, std::uint32_t pc) {
             g_vu1_entry = pc & 16383u;
             ++compiled;
             const ProgramFn jit = g_entries[(pc & 16383u) >> 3].jit;
+            static const std::uint64_t check_key = [] {
+                const char *k = std::getenv("PS2_VU_CHECK_KEY");
+                return !k ? 0ull : std::string(k) == "all" ? ~0ull : std::strtoull(k, nullptr, 16);
+            }();
+            if (check_key && (check_key == ~0ull || g_entries[(pc & 16383u) >> 3].key == check_key)) {
+                check_every_call(fn, pc & 16383u, check_key);
+                return;
+            }
             static std::uint64_t sampled = 0;
             static const bool check_vs_interpreter = std::getenv("PS2_VU_CHECK") != nullptr;
             static bool checking = false;
@@ -1419,6 +1577,10 @@ void run_fast(int n, std::uint32_t address) {
     if (count && ++calls % 20000 == 0) std::fprintf(stderr, "[vu1] %llu calls, %llu instructions\n", (unsigned long long)calls, (unsigned long long)total);
     BranchView view;
     for (std::uint32_t steps = 0; steps < 1'000'000; ++steps, ++total) {
+        if (g_stop_pc >= 0 && steps && pc == static_cast<std::uint32_t>(g_stop_pc)) [[unlikely]] {
+            pipe.flush_q(r);
+            return;
+        }
         if (!(steps & 0xFFu) && halted()) return;  // the window was closed: a program that does not end must not hold the close up for seconds
         std::uint32_t lo, hi;
         std::memcpy(&lo, u.code + pc, 4);
