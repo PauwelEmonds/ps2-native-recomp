@@ -33,10 +33,20 @@ which would change the vector units' results: scripts/cxx.sh).
    permission), or copy it into the app's folder:
    `adb push game.iso /sdcard/Android/data/ps2native.<name>/files/<name>.iso`
 3. The same folder holds the memory card (`<name>.ps2`), `keys.ini`, quick saves, reports and `log.txt`; the log also
-   goes to logcat: `adb logcat -s ps2native`. Every 5 seconds a `[speed]` line gives the frames per second.
+   goes to logcat: `adb logcat -s ps2native`. Every 5 seconds a `[speed]` line gives the frames per second. A new memory
+   card starts formatted and empty (on every platform), so the game saves on it without asking to format it first
+   (`PS2_MEMCARD_BLANK=1` gives the unformatted card of a new console card instead).
 
-A game controller (Bluetooth or USB, any controller SDL knows) is the way to play; a keyboard works with `keys.ini`.
-There are no touch buttons yet.
+On the screen are touch controls, a PS2 controller (host/touch.cpp; the model is OpenTricky's on-screen pad): a stick appears
+where the left thumb lands on the left half (pushed far it also presses the d-pad, for menus that read only that), triangle
+circle cross square on the right, L1 L2 and R1 R2 in the top corners, SELECT and START at the top and beside them a button
+that opens the quick menu (save, load, look; a tap on an entry chooses it, a tap beside them goes back). Every press lasts at
+least 200 ms, since a game's menus may miss a quicker tap. A game controller (Bluetooth or USB, any controller SDL knows) or a
+keyboard (`keys.ini`) works too; the touch controls hide while one is used and come back at the next touch. On a computer
+`PS2_TOUCH=1` shows them, with the left mouse button as the finger.
+
+The picture look starts as "crisp + smooth edges" on Android: the sharp looks cost the phone's graphics chip too much
+(on a Mali-G68 the THPS4 menu ran at ~30 fps with "sharp + smooth edges", 50 with the crisp or soft looks).
 
 For tests, the launcher takes extras: `args` (more options) and `env` (PS2_ variables), for example
 `adb shell "am start -n ps2native.<name>/ps2native.app.LauncherActivity -e env 'PS2_SCALE=2'"`.

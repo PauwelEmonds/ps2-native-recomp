@@ -52,6 +52,7 @@
 #include "ps2/os.hpp"
 #include "ps2/video.hpp"
 #include "stretch.hpp"
+#include "touch.hpp"
 #ifdef PS2_GPU
 #include "../runtime/src/gs/gpu/overlay.hpp"  // the quick menu's panel in the WebGPU present pass
 #endif
@@ -777,6 +778,7 @@ void poll_port(int port) {
     std::uint8_t l2 = 0xFF, r2 = 0xFF;
     std::uint8_t lx = 0x80, ly = 0x80, rx = 0x80, ry = 0x80;
     if (port == 0) read_keyboard(pressed, lx, ly, rx, ry);
+    if (port == 0) touch::pad(pressed, lx, ly);  // the on-screen controls (touch.cpp), on the first controller
     if (pad) {
         for (const PadBinding &b : kPadButtons)
             if (b.button != SDL_CONTROLLER_BUTTON_BACK && SDL_GameControllerGetButton(pad, b.button)) pressed |= b.mask;
@@ -976,6 +978,7 @@ void open_menu(const char *why) {
     g_note_text.clear();
     g_key_note.clear();
     g_menu.open();
+    touch::release_all();  // the fingers' FINGERUP go to the menu now: nothing may stay held on the touch controls
     g_menu.set_key_rows(keymap::kChangeableCount);
     g_menu_hold.store(true, std::memory_order_release);
     g_menu_opened_ticks = SDL_GetTicks();
@@ -1254,6 +1257,16 @@ bool menu_event(const SDL_Event &e) {
     case SDL_MOUSEWHEEL:
         if (e.wheel.y) move(e.wheel.y > 0 ? -1 : 1);
         return true;
+    case SDL_FINGERDOWN: {  // a tap on an entry chooses it; beside the entries it is Circle (a page back, or the menu closes)
+        int pw = 0, ph = 0;
+        window_pixels(pw, ph);
+        if (g_menu.select_at(static_cast<int>(e.tfinger.x * static_cast<float>(pw)), static_cast<int>(e.tfinger.y * static_cast<float>(ph))))
+            menu_command(g_menu.choose(), 1);
+        else
+            back("a tap beside the entries");
+        return true;
+    }
+    case SDL_FINGERMOTION: case SDL_FINGERUP: return true;
     default: return false;
     }
 }
@@ -1322,6 +1335,11 @@ void poll() {
             close_menu("the window was closed");  // a game that waits for the menu must go on to see the halt
         }
         if (menu_event(e)) continue;
+        {
+            int pw = 0, ph = 0;
+            window_pixels(pw, ph);
+            if (touch::event(e, pw, ph)) continue;  // a finger on the on-screen controls (touch.cpp)
+        }
         if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F11 && !e.key.repeat) toggle_fullscreen();
         // F1 the quick menu (menu_event), F5 quick save, F8 quick load, F9 "something is wrong here" (the game's own buttons: keys.ini,
         // host/keymap.cpp); a help key of the player's own shows the key card at once
@@ -1338,6 +1356,7 @@ void poll() {
         // back with a new one. SDL blocks this thread while the app is in the background, so both events usually come together
         // on the way back. The emulation waits meanwhile: the sound device is paused and sets the pace.
         if (e.type == SDL_APP_WILLENTERBACKGROUND && g_gpu_present) ps2::detach_window();
+        if (e.type == SDL_APP_WILLENTERBACKGROUND) touch::release_all();  // a finger lifted while the app was away sends no FINGERUP here
         if (e.type == SDL_APP_DIDENTERFOREGROUND && g_gpu_present) {
             ps2::detach_window();
             const bool attached = attach_gpu();
@@ -1374,6 +1393,12 @@ void poll() {
     }
     window_stage("reading the controllers");
     const auto after_events = ps2::hitch::on() ? ps2::hitch::Clock::now() : ps2::hitch::Clock::time_point{};
+    if (touch::take_options()) open_menu("the options button of the touch controls");
+    if (g_gpu_present) {
+        int pw = 0, ph = 0;
+        window_pixels(pw, ph);
+        touch::draw(pw, ph, g_menu.is_open());
+    }
     poll_port(0);
     poll_port(1);
     show_notice();
@@ -1895,7 +1920,10 @@ bool open_window(bool fullscreen) {
     // Without a graphics API flag SDL puts an OpenGL ES surface on the window, and wgpu's Vulkan surface then cannot have it
     // (ERROR_NATIVE_WINDOW_IN_USE_KHR). A resizable window would also let SDL turn the screen upright: keep it landscape.
     if (!std::getenv("PS2_SDL_RENDERER")) flags |= SDL_WINDOW_VULKAN;
+    // full screen: SDL hides the status and navigation bars (immersive), which otherwise lie over the picture and the touch controls
+    flags |= SDL_WINDOW_FULLSCREEN;
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+    SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");  // fingers are the on-screen controls' (touch.cpp), not left mouse clicks
 #endif
     g_game_title = ps2::os::env("PS2_WINDOW_TITLE");
     const std::string initial_title = g_game_title.empty() ? g_speed_title : g_game_title + "   |   " + g_speed_title;

@@ -328,6 +328,88 @@ std::string card_problem(const std::uint8_t *data, std::size_t size) {
     return {};
 }
 
+// A formatted, empty 8 MB card, as a console leaves one after formatting: the same layout scripts/mcformat.py make_card writes (see
+// the sources named there: mymc's format() and ps2sdk mcman's mcman_format2). The superblock in page 0, the indirect FAT in cluster
+// 8, the FAT in clusters 9 to 40, the root directory ("." and "..") in cluster 41; every other page erased (0xFF, spare bytes too).
+// A new card starts like this so a game saves on it at once, instead of first stopping at "the card is unformatted". The date in
+// the root directory's entries is fixed (1 January 2002), so two runs make the same card and replays stay the same.
+std::vector<std::uint8_t> formatted_card() {
+    constexpr std::uint32_t kPage = 512, kCluster = 1024, kPagesPerCluster = kCluster / kPage, kEntries = kCluster / 4;
+    constexpr std::uint32_t kClusters = kPages / kPagesPerCluster, kBlocks = kPages / kBlockPages;
+    constexpr std::uint32_t kFirstIfc = 0x2000 / kCluster;                                    // 8
+    constexpr std::uint32_t kFatClusters = (kClusters - (kFirstIfc + 2) + kEntries - 1) / kEntries;  // 32
+    constexpr std::uint32_t kIfcClusters = (kFatClusters + kEntries - 1) / kEntries;          // 1
+    constexpr std::uint32_t kFatEntries = kFatClusters * kEntries;
+    constexpr std::uint32_t kAllocOffset = kFirstIfc + kIfcClusters + kFatClusters;           // 41
+    constexpr std::uint32_t kBackup1 = kBlocks - 1, kBackup2 = kBlocks - 2;
+    constexpr std::uint32_t kAllocEnd = kBackup2 * (kBlockPages / kPagesPerCluster) - kAllocOffset;  // 8135
+    static_assert(kAllocOffset == 41 && kAllocEnd == 8135, "the layout of an 8 MB card (mcformat.py layout())");
+    std::vector<std::uint8_t> data(static_cast<std::size_t>(kPages) * kPage, 0);
+    std::vector<bool> used(kPages, false);
+    const auto put32 = [&](std::size_t at, std::uint32_t v) {
+        for (int i = 0; i < 4; ++i) data[at + i] = static_cast<std::uint8_t>(v >> (8 * i));
+    };
+    const auto put16 = [&](std::size_t at, std::uint32_t v) {
+        data[at] = static_cast<std::uint8_t>(v);
+        data[at + 1] = static_cast<std::uint8_t>(v >> 8);
+    };
+    const auto mark = [&](std::size_t from, std::size_t bytes) {
+        for (std::size_t p = from / kPage; p < (from + bytes + kPage - 1) / kPage; ++p) used[p] = true;
+    };
+    // indirect FAT: the FAT's clusters, the rest 0xFFFFFFFF
+    for (std::uint32_t i = 0; i < kEntries; ++i)
+        put32(kFirstIfc * kCluster + i * 4, i < kFatClusters ? kFirstIfc + kIfcClusters + i : 0xFFFFFFFFu);
+    mark(kFirstIfc * kCluster, kCluster);
+    // FAT: entry 0 (the root directory) in use and the end of its chain, then free up to kAllocEnd, then in use (the backup blocks)
+    for (std::uint32_t i = 0; i < kFatEntries; ++i) {
+        const std::uint32_t v = (i == 0 || i >= kAllocEnd) ? 0xFFFFFFFFu : 0x7FFFFFFFu;
+        const std::uint32_t cluster = kFirstIfc + kIfcClusters + i / kEntries;
+        put32(static_cast<std::size_t>(cluster) * kCluster + (i % kEntries) * 4, v);
+    }
+    mark(static_cast<std::size_t>(kFirstIfc + kIfcClusters) * kCluster, static_cast<std::size_t>(kFatClusters) * kCluster);
+    // root directory: "." (mode 0x8427, 2 entries) and ".." (mode 0xA426); mymc ps2mc_dir.py's entry layout
+    const auto dirent = [&](std::size_t at, std::uint32_t mode, std::uint32_t length, const char *name) {
+        put16(at, mode);
+        put32(at + 4, length);
+        const std::uint8_t date[8] = {0, 0, 0, 0, 1, 1, 0xD2, 0x07};  // zero, second, minute, hour, day 1, month 1, year 2002
+        std::memcpy(&data[at + 8], date, 8);    // created
+        std::memcpy(&data[at + 24], date, 8);   // modified (cluster 0 at 16 and parent entry 0 at 20 stay zero)
+        std::memcpy(&data[at + 64], name, std::strlen(name));
+    };
+    const std::size_t root = static_cast<std::size_t>(kAllocOffset) * kCluster;
+    dirent(root, 0x8427, 2, ".");
+    dirent(root + 512, 0xA426, 0, "..");
+    mark(root, kCluster);
+    // superblock (mymc pack_superblock)
+    static const char kMagic[] = "Sony PS2 Memory Card Format ", kVersion[] = "1.2.0.0";
+    std::memcpy(&data[0], kMagic, sizeof kMagic - 1);
+    std::memcpy(&data[28], kVersion, sizeof kVersion - 1);
+    put16(40, kPage);
+    put16(42, kPagesPerCluster);
+    put16(44, kBlockPages);
+    put16(46, 0xFF00);
+    put32(48, kClusters);
+    put32(52, kAllocOffset);
+    put32(56, kAllocEnd);
+    put32(60, 0);  // the root directory's cluster
+    put32(64, kBackup1);
+    put32(68, kBackup2);
+    for (std::uint32_t i = 0; i < 32; ++i) put32(80 + i * 4, i < kIfcClusters ? kFirstIfc + i : 0);
+    for (std::uint32_t i = 0; i < 32; ++i) put32(208 + i * 4, 0xFFFFFFFFu);  // no bad blocks
+    data[336] = 2;     // card type: PS2
+    data[337] = 0x2B;  // the flags the card reports
+    used[0] = true;
+    // the raw pages: data and ECC for the pages written above, every other page erased
+    std::vector<std::uint8_t> card(kCardBytes, 0xFF);
+    for (std::uint32_t page = 0; page < kPages; ++page) {
+        if (!used[page]) continue;
+        std::uint8_t *raw = &card[static_cast<std::size_t>(page) * kPageBytes];
+        std::memcpy(raw, &data[static_cast<std::size_t>(page) * kPage], kPage);
+        page_ecc(raw, raw + kPage);
+    }
+    return card;
+}
+
 namespace {
 
 enum class CardFile { missing, empty, good, unusable, damaged };
@@ -561,10 +643,14 @@ void load_card() {
     if (exists(c.crash_file))
         std::fprintf(stderr, "[mc] note: %s holds the card as it was when the program crashed on an earlier run; %s is the last card written normally.\n",
                      c.crash_file.c_str(), c.file.c_str());
+    // a new card is formatted (formatted_card), so the game can save at once; PS2_MEMCARD_BLANK=1 gives the erased card a console's
+    // new card is instead (the game then asks to format it, or says it is unformatted). The new card is written out like a changed one.
+    const bool blank = got != CardFile::good && std::getenv("PS2_MEMCARD_BLANK") != nullptr;
     if (got == CardFile::good) c.data.swap(data);
-    else c.data.assign(kCardBytes, 0xFF);
+    else if (blank) c.data.assign(kCardBytes, 0xFF);
+    else c.data = formatted_card(), c.dirty = true;
     c.present = true;
-    std::fprintf(stderr, "[mc] card in slot 1: %s%s\n", c.file.c_str(), got == CardFile::good ? "" : " (new, unformatted)");
+    std::fprintf(stderr, "[mc] card in slot 1: %s%s\n", c.file.c_str(), got == CardFile::good ? "" : blank ? " (new, unformatted)" : " (new, formatted, empty)");
 }
 
 void memory_card(std::size_t at, std::uint32_t out_size) {

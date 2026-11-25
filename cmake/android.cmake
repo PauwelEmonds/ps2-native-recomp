@@ -21,7 +21,8 @@ add_library(main SHARED
     host/window.cpp
     host/keymap.cpp
     host/quickmenu.cpp
-    host/stretch.cpp)
+    host/stretch.cpp
+    host/touch.cpp)
 target_compile_definitions(main PRIVATE PS2_WINDOW)
 # SDLActivity calls SDL_main (host/android_main.cpp), which calls the runner's own main under another name
 set_source_files_properties(host/main.cpp PROPERTIES COMPILE_DEFINITIONS main=ps2_host_main)

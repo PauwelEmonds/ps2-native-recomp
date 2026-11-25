@@ -103,6 +103,16 @@ struct Overlay {
     std::uint32_t x = 0, y = 0, width = 0, height = 0;
     bool on = false;
 } g_overlay;
+// The touch controls (overlay.hpp set_touch_shapes): their shapes and glyph segments in storage buffers, one instanced draw.
+struct Touch {
+    WGPURenderPipeline pipeline = nullptr;
+    WGPUBindGroupLayout layout = nullptr;
+    WGPUBindGroup group = nullptr;
+    WGPUBuffer shapes = nullptr, segments = nullptr, screen = nullptr;
+    std::uint64_t shape_bytes = 0, segment_bytes = 0;  // the buffers' sizes
+    std::uint32_t count = 0;                           // shapes to draw (0: none)
+    bool failed = false;
+} g_touch;
 std::uint32_t g_field = 0, g_last_width = 0, g_last_height = 0;
 std::uint32_t g_picture_epoch = 0;  // counts what changes the picture without the game drawing: the quick menu's panel, a loaded state, a new swap chain
 bool g_have_previous = false;
@@ -2694,6 +2704,12 @@ void encode_present(WGPUCommandEncoder enc, WGPUTextureView view, const WGPUPass
     wgpuRenderPassEncoderSetPipeline(rp, pipeline ? pipeline : g_blit);
     wgpuRenderPassEncoderSetBindGroup(rp, 0, g_blit_group, 0, nullptr);
     wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
+    if (!pipeline && g_touch.count && g_touch.group && g_surface_width && g_surface_height) {  // the touch controls, over the whole window
+        wgpuRenderPassEncoderSetViewport(rp, 0.0f, 0.0f, w, h, 0.0f, 1.0f);
+        wgpuRenderPassEncoderSetPipeline(rp, g_touch.pipeline);
+        wgpuRenderPassEncoderSetBindGroup(rp, 0, g_touch.group, 0, nullptr);
+        wgpuRenderPassEncoderDraw(rp, 6, g_touch.count, 0, 0);
+    }
     if (!pipeline && g_overlay.on && g_overlay.group && g_surface_width && g_surface_height) {
         // the panel's own rectangle, cut to the window (a window made smaller than the panel shows its top left part)
         const std::uint32_t ox = std::min(g_overlay.x, g_surface_width - 1), oy = std::min(g_overlay.y, g_surface_height - 1);
@@ -5768,6 +5784,164 @@ void set_overlay(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t h
     g_overlay.width = width;
     g_overlay.height = height;
     g_overlay.on = g_overlay.group != nullptr;
+}
+
+namespace {
+
+// The touch controls' shader: six corners per shape (two triangles over its box), and per pixel the distance to the rounded box or to
+// the glyph's strokes (as host/touch.cpp's model, OpenTricky's touch_sdl.c). The output is premultiplied.
+constexpr const char *kTouchShader = R"(
+struct Shape { rect: vec4<f32>, fill: vec4<f32>, line: vec4<f32>, p: vec4<f32>, q: vec4<u32> };
+@group(0) @binding(0) var<storage, read> shapes: array<Shape>;
+@group(0) @binding(1) var<storage, read> segments: array<vec4<f32>>;
+@group(0) @binding(2) var<uniform> screen: vec4<f32>;
+struct Out {
+    @builtin(position) position: vec4<f32>,
+    @location(0) px: vec2<f32>,
+    @location(1) @interpolate(flat) id: u32,
+}
+@vertex
+fn vs(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> Out {
+    let s = shapes[i];
+    let c = vec2<f32>(select(0.0, 1.0, v == 1u || v == 4u || v == 5u), select(0.0, 1.0, v == 2u || v == 3u || v == 5u));
+    let p = mix(s.rect.xy, s.rect.zw, c);
+    var o: Out;
+    o.position = vec4<f32>(p.x / screen.x * 2.0 - 1.0, 1.0 - p.y / screen.y * 2.0, 0.0, 1.0);
+    o.px = p - (s.rect.xy + s.rect.zw) * 0.5;
+    o.id = i;
+    return o;
+}
+fn seg(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
+    let pa = p - a;
+    let ba = b - a;
+    return length(pa - ba * clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0));
+}
+@fragment
+fn fs(in: Out) -> @location(0) vec4<f32> {
+    let s = shapes[in.id];
+    if (s.q.x == 0u) {
+        let rim_width = s.p.x;
+        let rad = s.p.y;
+        let soft = s.p.z;
+        let half_size = (s.rect.zw - s.rect.xy) * 0.5 - vec2<f32>(soft);
+        let q = abs(in.px) - half_size + rad;
+        let d = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - rad;
+        let aa = max(soft, 1.0);
+        let inside = 1.0 - smoothstep(-0.5 * aa, 0.5 * aa, d);
+        var rim = 0.0;
+        if (rim_width > 0.0) { rim = clamp(0.5 - (abs(d + rim_width * 0.5) - rim_width * 0.5), 0.0, 1.0); }
+        let f = s.fill.rgb + 0.07 * clamp(-in.px.y / max(half_size.y, 1.0), -1.0, 1.0);
+        let base = vec4<f32>(f * s.fill.a, s.fill.a) * inside;
+        let line = vec4<f32>(s.line.rgb * s.line.a, s.line.a) * rim;
+        return line + base * (1.0 - line.a);
+    }
+    var d = 1e9;
+    for (var k = 0u; k < s.q.z; k = k + 1u) {
+        let g = segments[s.q.y + k];
+        d = min(d, seg(in.px, g.xy, g.zw));
+    }
+    let a = clamp(0.5 - (d - s.p.w * 0.5), 0.0, 1.0);
+    return vec4<f32>(s.fill.rgb * s.fill.a, s.fill.a) * a;
+}
+)";
+
+bool make_touch_pipeline() {
+    WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+    source.code = view(kTouchShader);
+    WGPUShaderModuleDescriptor md = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+    md.nextInChain = &source.chain;
+    WGPUShaderModule module = wgpuDeviceCreateShaderModule(g_device, &md);
+    WGPUBindGroupLayoutEntry le[3] = {WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT};
+    for (int i = 0; i < 3; ++i) {
+        le[i].binding = static_cast<std::uint32_t>(i);
+        le[i].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+        le[i].buffer.type = i == 2 ? WGPUBufferBindingType_Uniform : WGPUBufferBindingType_ReadOnlyStorage;
+    }
+    WGPUBindGroupLayoutDescriptor ld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+    ld.entryCount = 3;
+    ld.entries = le;
+    g_touch.layout = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
+    WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+    pld.bindGroupLayoutCount = 1;
+    pld.bindGroupLayouts = &g_touch.layout;
+    WGPUPipelineLayout pipeline_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
+    WGPUBlendState blend = WGPU_BLEND_STATE_INIT;  // premultiplied
+    blend.color.operation = WGPUBlendOperation_Add;
+    blend.color.srcFactor = WGPUBlendFactor_One;
+    blend.color.dstFactor = WGPUBlendFactor_OneMinusSrcAlpha;
+    blend.alpha.operation = WGPUBlendOperation_Add;
+    blend.alpha.srcFactor = WGPUBlendFactor_One;
+    blend.alpha.dstFactor = WGPUBlendFactor_OneMinusSrcAlpha;
+    WGPUColorTargetState color = WGPU_COLOR_TARGET_STATE_INIT;
+    color.format = g_surface_format;
+    color.blend = &blend;
+    WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+    fragment.module = module;
+    fragment.entryPoint = view("fs");
+    fragment.targetCount = 1;
+    fragment.targets = &color;
+    WGPURenderPipelineDescriptor rd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+    rd.layout = pipeline_layout;
+    rd.vertex.module = module;
+    rd.vertex.entryPoint = view("vs");
+    rd.fragment = &fragment;
+    g_touch.pipeline = wgpuDeviceCreateRenderPipeline(g_device, &rd);
+    wgpuShaderModuleRelease(module);
+    wgpuPipelineLayoutRelease(pipeline_layout);
+    g_touch.screen = make_buffer(16, WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst);
+    if (!g_touch.pipeline) std::fprintf(stderr, "[gpu] cannot make the touch controls' pipeline: they are not shown\n");
+    return g_touch.pipeline != nullptr;
+}
+
+}  // namespace
+
+void set_touch_shapes(const TouchShape *shapes, std::uint32_t count, const float *segments, std::uint32_t segment_count, std::uint32_t window_width,
+                      std::uint32_t window_height) {
+    post::drain();  // the last picture's present (which reads these buffers) is submitted before they change
+    ++g_picture_epoch;
+    if (!shapes || !count || !g_surface || g_touch.failed) {
+        g_touch.count = 0;
+        return;
+    }
+    if (!g_touch.pipeline && !make_touch_pipeline()) {
+        g_touch.failed = true;
+        return;
+    }
+    const std::uint64_t shape_bytes = static_cast<std::uint64_t>(count) * sizeof(TouchShape);
+    const std::uint64_t segment_bytes = std::max<std::uint64_t>(static_cast<std::uint64_t>(segment_count) * 16, 16);
+    if (shape_bytes > g_touch.shape_bytes || segment_bytes > g_touch.segment_bytes || !g_touch.group) {
+        if (g_touch.group) wgpuBindGroupRelease(g_touch.group);
+        if (shape_bytes > g_touch.shape_bytes) {
+            if (g_touch.shapes) wgpuBufferRelease(g_touch.shapes);
+            g_touch.shape_bytes = std::max<std::uint64_t>(shape_bytes, 64 * sizeof(TouchShape));
+            g_touch.shapes = make_buffer(g_touch.shape_bytes, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+        }
+        if (segment_bytes > g_touch.segment_bytes) {
+            if (g_touch.segments) wgpuBufferRelease(g_touch.segments);
+            g_touch.segment_bytes = std::max<std::uint64_t>(segment_bytes, 512 * 16);
+            g_touch.segments = make_buffer(g_touch.segment_bytes, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+        }
+        WGPUBindGroupEntry be[3] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+        be[0].binding = 0;
+        be[0].buffer = g_touch.shapes;
+        be[0].size = WGPU_WHOLE_SIZE;
+        be[1].binding = 1;
+        be[1].buffer = g_touch.segments;
+        be[1].size = WGPU_WHOLE_SIZE;
+        be[2].binding = 2;
+        be[2].buffer = g_touch.screen;
+        be[2].size = 16;
+        WGPUBindGroupDescriptor bd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+        bd.layout = g_touch.layout;
+        bd.entryCount = 3;
+        bd.entries = be;
+        g_touch.group = wgpuDeviceCreateBindGroup(g_device, &bd);
+    }
+    wgpuQueueWriteBuffer(g_queue, g_touch.shapes, 0, shapes, shape_bytes);
+    if (segment_count) wgpuQueueWriteBuffer(g_queue, g_touch.segments, 0, segments, static_cast<std::size_t>(segment_count) * 16);
+    const float screen[4] = {static_cast<float>(std::max(window_width, 1u)), static_cast<float>(std::max(window_height, 1u)), 0.0f, 0.0f};
+    wgpuQueueWriteBuffer(g_queue, g_touch.screen, 0, screen, sizeof screen);
+    g_touch.count = g_touch.group ? count : 0;
 }
 
 bool present_again() {
