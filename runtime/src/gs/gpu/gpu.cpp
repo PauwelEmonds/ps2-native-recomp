@@ -112,6 +112,8 @@ std::uint32_t g_sharp_2d = 1;
 std::uint32_t field_base(std::uint32_t field) { return g_copy_words + (field & 1u) * g_field_words; }
 
 bool g_timestamps = false;
+double g_tick_ns = 1.0;  // nanoseconds per timestamp tick (wgpuQueueGetTimestampPeriod): 1 on the PC's drivers, ~38.5 on Mali (a 26 MHz counter)
+std::uint64_t ticks_ns(std::uint64_t from, std::uint64_t to) { return to > from ? static_cast<std::uint64_t>(static_cast<double>(to - from) * g_tick_ns) : 0; }
 std::uint32_t g_vendor_id = 0;  // PCI vendor id of the chosen adapter (0x8086 Intel), 0 when unknown
 WGPUQuerySet g_queries = nullptr;
 WGPUBuffer g_query_resolve = nullptr, g_query_read = nullptr;
@@ -2769,8 +2771,91 @@ void blit_check() {
     wgpuTextureRelease(tex[1]);
 }
 
+// PS2_GPU_PROFILE without timestamp queries (e.g. Mali on Android): the processor's clock around a submit and the wait for it. On even frames
+// every command is a submit of its own (line "<frame> <i> <kind> <ns> <x> <y> ..." as with the queries, the submit's cost included); on odd
+// frames all of them go in one pass, timed as a whole (line "<frame> all <commands> <ns>"), so the sum of the single ones shows what the
+// steps between commands cost. A line "<frame> empty - <ns>" gives an empty submit and wait, the floor of each single number.
+void profile_submit_clocked(WGPUTextureView present_view) {
+    using Clock = std::chrono::steady_clock;
+    const auto ns = [](Clock::time_point a) { return static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - a).count()); };
+    const auto run = [](WGPUCommandEncoder enc) {
+        WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
+        wgpuQueueSubmit(g_queue, 1, &cmd);
+        wgpuCommandBufferRelease(cmd);
+        wgpuCommandEncoderRelease(enc);
+        wgpuDevicePoll(g_device, true, nullptr);
+    };
+    ensure_capacity();
+    upload_data();
+    wt::write(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
+    wgpuDevicePoll(g_device, true, nullptr);  // the writes and everything before are done before the clock starts
+    const unsigned long long frame = frame_count();
+    {
+        const auto t = Clock::now();
+        run(wgpuDeviceCreateCommandEncoder(g_device, nullptr));
+        std::fprintf(g_profile_out, "%llu empty - %llu\n", frame, ns(t));
+    }
+    const bool single = frame % 2 == 0;
+    const auto encode = [](WGPUComputePassEncoder pass, const Command &c) {
+        wgpuComputePassEncoderSetPipeline(pass, pipeline_of(c));
+        const std::uint32_t offset = c.param * kParamStride;
+        wgpuComputePassEncoderSetBindGroup(pass, 0, g_group, 1, &offset);
+        wgpuComputePassEncoderDispatchWorkgroups(pass, c.x, c.y, 1);
+    };
+    if (single) {
+        std::size_t info = 0;
+        for (std::uint32_t i = 0; i < g_commands.size(); ++i) {
+            const Command &c = g_commands[i];
+            ++g_dispatches[c.pipeline];
+            WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+            WGPUComputePassDescriptor cd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+            WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
+            encode(pass, c);
+            wgpuComputePassEncoderEnd(pass);
+            wgpuComputePassEncoderRelease(pass);
+            const auto t = Clock::now();
+            run(enc);
+            const unsigned long long took = ns(t);
+            while (info < g_command_info.size() && g_command_info[info].index < i) ++info;
+            std::fprintf(g_profile_out, "%llu %u %s %llu %u %u", frame, i, kEntryPoints[c.pipeline], took, c.x, c.y);
+            if (info < g_command_info.size() && g_command_info[info].index == i)
+                for (std::uint32_t v : g_command_info[info].values) std::fprintf(g_profile_out, " %u", v);
+            std::fprintf(g_profile_out, "\n");
+        }
+    } else {
+        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+        WGPUComputePassDescriptor cd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+        WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
+        for (const Command &c : g_commands) ++g_dispatches[c.pipeline], encode(pass, c);
+        wgpuComputePassEncoderEnd(pass);
+        wgpuComputePassEncoderRelease(pass);
+        const auto t = Clock::now();
+        run(enc);
+        std::fprintf(g_profile_out, "%llu all %zu %llu\n", frame, g_commands.size(), ns(t));
+    }
+    if (present_view) {
+        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+        encode_present(enc, present_view, nullptr);
+        const auto t = Clock::now();
+        run(enc);
+        std::fprintf(g_profile_out, "%llu present - %llu %u %u %u %u\n", frame, ns(t), g_surface_width, g_surface_height, post::g_blit[0], post::g_blit[1]);
+    }
+    std::fflush(g_profile_out);
+    g_commands.clear();
+    g_command_info.clear();
+    ++g_serial;
+    g_param_records.clear();
+    g_arena.clear();
+    g_shapes.restart();
+    g_decoded_used = 0;
+    g_clut_loads = 0;
+}
+
 // PS2_GPU_PROFILE in a window also times the picture's render pass (blit and overlay), as a line "present" after the frame's commands.
 void profile_submit(WGPUTextureView present_view) {
+    static bool said = false;
+    if (!said) said = true, std::fprintf(stderr, "[gpu] PS2_GPU_PROFILE: %s\n", g_timestamps ? "timestamp queries" : "the processor's clock (no timestamp queries)");
+    if (!g_timestamps) return profile_submit_clocked(present_view);
     constexpr std::uint32_t kMax = 2048;
     if (!g_profile_queries) {
         WGPUQuerySetDescriptor qd = WGPU_QUERY_SET_DESCRIPTOR_INIT;
@@ -2833,16 +2918,17 @@ void profile_submit(WGPUTextureView present_view) {
         for (std::uint32_t i = 0; t && i < n; ++i) {
             while (info < g_command_info.size() && g_command_info[info].index < i) ++info;
             std::fprintf(g_profile_out, "%llu %u %s %llu %u %u", static_cast<unsigned long long>(frame_count()), i, kEntryPoints[g_commands[i].pipeline],
-                         static_cast<unsigned long long>(t[i * 2 + 1] > t[i * 2] ? t[i * 2 + 1] - t[i * 2] : 0), g_commands[i].x, g_commands[i].y);
+                         static_cast<unsigned long long>(ticks_ns(t[i * 2], t[i * 2 + 1])), g_commands[i].x, g_commands[i].y);
             if (info < g_command_info.size() && g_command_info[info].index == i)
                 for (std::uint32_t v : g_command_info[info].values) std::fprintf(g_profile_out, " %u", v);
             std::fprintf(g_profile_out, "\n");
         }
         if (t && timed > n)
             std::fprintf(g_profile_out, "%llu %u present %llu %u %u %u %u %u %u\n", static_cast<unsigned long long>(frame_count()), n,
-                         static_cast<unsigned long long>(t[n * 2 + 1] > t[n * 2] ? t[n * 2 + 1] - t[n * 2] : 0), g_surface_width, g_surface_height, post::g_blit[0],
+                         static_cast<unsigned long long>(ticks_ns(t[n * 2], t[n * 2 + 1])), g_surface_width, g_surface_height, post::g_blit[0],
                          post::g_blit[1], post::g_blit[4], post::g_blit[7]);  // window size, picture size, blend of two fields, look
         wgpuBufferUnmap(g_profile_read);
+        std::fflush(g_profile_out);
     }
     if (present_view) blit_check();
     g_commands.clear();
@@ -2884,7 +2970,7 @@ void submit(WGPUTextureView present_view = nullptr) {
     finish_tiles(true);  // the helper's lists go into the arena before it is measured, copied or uploaded
     place_shapes();
     if (g_bench.capturing) bench_capture();
-    if (g_profile_out && g_timestamps && frame_count() >= g_profile_from && frame_count() < g_profile_to) {
+    if (g_profile_out && frame_count() >= g_profile_from && frame_count() < g_profile_to) {
         write_blit();
         post::g_presented_async = false;
         profile_submit(present_view);
@@ -2919,7 +3005,7 @@ void submit(WGPUTextureView present_view = nullptr) {
             std::uint64_t t[2];
             std::memcpy(t, mapped, sizeof t);
             if (t[1] > t[0]) {
-                g_measured_ns += t[1] - t[0];
+                g_measured_ns += ticks_ns(t[0], t[1]);
                 ++g_measured;
             }
         }
@@ -4097,6 +4183,13 @@ bool init(Mode m) {
     else if (order.size() > 1) std::fprintf(stderr, "[gpu] graphics API: %s (%s could not be used, see above)\n", chosen->name, order[0].name);
     if (g_dx12_compiler) std::fprintf(stderr, "[gpu] Direct3D 12 shader compiler: %s (PS2_DX12_COMPILER=fxc|dxc picks)\n", g_dx12_compiler);
     g_queue = wgpuDeviceGetQueue(g_device);
+#ifndef __EMSCRIPTEN__
+    if (g_timestamps) {
+        const float period = wgpuQueueGetTimestampPeriod(g_queue);
+        if (period > 0.0f) g_tick_ns = period;
+        if (period != 1.0f) std::fprintf(stderr, "[gpu] timestamp ticks of %.2f ns\n", static_cast<double>(period));
+    }
+#endif
 
     if (const std::string spec = os::env("PS2_GPU_PROFILE"); !spec.empty()) {
         char path[512] = {};
