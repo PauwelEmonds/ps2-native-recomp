@@ -277,9 +277,113 @@ void spin_watch(std::uint32_t value) {
     w.streak = 0;
 }
 
+// The same skip for a waiting loop in plain memory: a game that waits for a flag an interrupt handler clears, in a loop that
+// only reads memory (THPS4: `do {} while (get_flag())`, about two thirds of the emulation thread on a phone). The translator
+// finds such loops (recomp/codegen.cpp, poll_loop: nothing but loads, integer work on general registers and calls of
+// functions of the same kind) and calls spin_turn at the end of every turn that goes round again, with the registers a turn
+// writes; where the loop is left it calls spin_leave, so two calls in a row for the same loop are two turns in a row
+// (a strlen called again and again on the same string is not one loop turning). Nothing else can change: memory is only
+// read, the other registers are not written. So when those registers and the cycles of a turn are the same over three
+// turns in a row, with no slow memory access, system call, event or unwinding preempt() in between, every further turn
+// up to the next event is the same as well, and the clock moves forward by whole turns, as
+// many as end before the budget of the slice runs out (the loop asks preempt() only once it is below zero, and an event
+// can only come in there). The result is the same, cycle for cycle, as running the turns. PS2_NO_SPIN_SKIP=1 switches it
+// off, PS2_EE_POLL=0 at translation leaves the calls out, PS2_SPIN_VERIFY=1 checks it.
+struct LoopWatch {
+    std::uint32_t turns = 0;
+    std::uint64_t seq = 0, events = 0, at = 0, delta = 0;
+    Reg128 r[32];
+};
+LoopWatch g_loop;
+
+bool same_written(const LoopWatch &w, const Cpu &c, std::uint32_t written) {
+    for (std::uint32_t m = written; m; m &= m - 1) {
+        const int n = __builtin_ctz(m);
+        if (std::memcmp(&w.r[n], &c.r[n], sizeof(Reg128)) != 0) return false;
+    }
+    return true;
+}
+
+void keep_written(LoopWatch &w, const Cpu &c, std::uint32_t written) {
+    for (std::uint32_t m = written; m; m &= m - 1) {
+        const int n = __builtin_ctz(m);
+        w.r[n] = c.r[n];
+    }
+}
+
 }  // namespace
 
+std::uint64_t g_event_seq = 0;
+
 std::uint64_t spin_skipped_cycles() { return g_spin.skipped; }
+
+}  // namespace ps2::hw
+
+namespace ps2 {
+
+namespace {
+std::uint32_t g_spin_loop = 0;  // the waiting loop spin_turn looks at, 0 when it was left
+}
+
+void spin_leave() { g_spin_loop = 0; }
+
+void spin_turn(Cpu &c, std::uint32_t pc, std::uint32_t written) {
+    using namespace hw;
+    LoopWatch &w = g_loop;
+    if (g_spin.off) return;
+    const std::uint64_t t = now();
+    // PS2_SPIN_VERIFY=1: no skip; the turns that would have been skipped run, and one that differs is reported (a loop
+    // the translator should not have taken for a waiting loop, or a change of memory the skip does not know of)
+    static const bool verify = std::getenv("PS2_SPIN_VERIFY") != nullptr;
+    static std::uint64_t verify_until = 0;
+    if (verify && t < verify_until) {
+        if (pc != g_spin_loop || g_slow_seq != w.seq || g_event_seq != w.events || !same_written(w, c, written) || t - w.at != w.delta) {
+            std::fprintf(stderr, "[spin-verify] loop 0x%08X frame %llu: turn at %llu differs: pc 0x%08X seq %d events %d delta %llu/%llu regs", g_spin_loop,
+                         static_cast<unsigned long long>(frames_run()), static_cast<unsigned long long>(t), pc, g_slow_seq != w.seq, g_event_seq != w.events,
+                         static_cast<unsigned long long>(t - w.at), static_cast<unsigned long long>(w.delta));
+            for (std::uint32_t m = written; m; m &= m - 1) {
+                const int n = __builtin_ctz(m);
+                if (std::memcmp(&w.r[n], &c.r[n], sizeof(Reg128)) != 0)
+                    std::fprintf(stderr, " r%d %llx->%llx", n, static_cast<unsigned long long>(w.r[n].d[0]), static_cast<unsigned long long>(c.r[n].d[0]));
+            }
+            std::fprintf(stderr, "\n");
+            verify_until = 0;
+        } else {
+            w.at = t;
+            return;
+        }
+    }
+    if (pc != g_spin_loop || g_slow_seq != w.seq || g_event_seq != w.events || t <= w.at || !same_written(w, c, written)) {
+        g_spin_loop = pc;  // another loop, the loop was left, something else happened, or the registers moved on: a first turn
+        w.seq = g_slow_seq;
+        w.events = g_event_seq;
+        w.at = t;
+        w.turns = 0;
+        keep_written(w, c, written);
+        return;
+    }
+    const std::uint64_t delta = t - w.at;
+    w.at = t;
+    if (w.turns == 0 || delta != w.delta) {  // the same registers once, or a turn of another length: count from here
+        w.delta = delta;
+        w.turns = 1;
+        return;
+    }
+    const std::int64_t left = c.budget;
+    if (left <= static_cast<std::int64_t>(delta) + 1) return;
+    const std::int64_t skip = static_cast<std::int64_t>(static_cast<std::uint64_t>(left - 1) / delta * delta);
+    if (verify) {
+        verify_until = t + static_cast<std::uint64_t>(skip);
+        return;
+    }
+    c.budget = static_cast<std::int32_t>(left - skip);
+    g_spin.skipped += static_cast<std::uint64_t>(skip);
+    w.at = now();
+}
+
+}  // namespace ps2
+
+namespace ps2::hw {
 
 std::uint32_t read_intc_stat() {
     const std::uint32_t value = g_intc_stat | (kernel::interruptible() ? g_intc_latched : 0u);

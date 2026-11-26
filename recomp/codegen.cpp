@@ -557,6 +557,112 @@ private:
         return counts == 1 ? x : 0u;
     }
 
+    // An instruction a waiting loop may hold (poll_loop): it reads memory or works on general registers only, so it cannot
+    // change anything but the registers it writes, which go into `written`. No store, no system call or trap, no other
+    // processor (COP0's counter, the FPU, VU0), and nothing that can stop on an overflow (ADD, SUB, DADD, DSUB, ADDI, DADDI).
+    static bool poll_insn(const Insn &s, std::uint32_t &written) {
+        switch (s.op) {
+        case Sll: case Srl: case Sra: case Sllv: case Srlv: case Srav: case Addu: case Subu: case And: case Or: case Xor: case Nor:
+        case Slt: case Sltu: case Daddu: case Dsubu: case Dsll: case Dsrl: case Dsra: case Dsll32: case Dsrl32: case Dsra32:
+        case Dsllv: case Dsrlv: case Dsrav: case Movz: case Movn: case Mfhi: case Mflo:
+            written |= 1u << s.rd();
+            return true;
+        case Addiu: case Daddiu: case Slti: case Sltiu: case Andi: case Ori: case Xori: case Lui:
+        case Lb: case Lbu: case Lh: case Lhu: case Lw: case Lwu: case Ld: case Lq: case Lwl: case Lwr: case Ldl: case Ldr:
+            written |= 1u << s.rt();
+            return true;
+        case Sync: case Pref:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    bool plain_code(std::uint32_t p) const {
+        return p_.is_code(p) && !options_.probes.count(p) && !options_.toggles.count(p);
+    }
+
+    // A function a waiting loop may call: a straight line of poll_insn instructions that returns with `jr ra`, like a getter
+    // (THPS4 waits in `do {} while (get_flag())`, where get_flag is `lui v1, hi; jr ra; lw v0, lo(v1)`).
+    bool poll_leaf(std::uint32_t p, std::uint32_t &written, int &count) const {
+        for (int k = 0; k < kPollMax; ++k, p += 4) {
+            if (!plain_code(p)) return false;
+            const Insn s = at(p);
+            if (s.op == Jr && s.rs() == 31) {
+                count += k + 2;
+                return plain_code(p + 4) && poll_insn(at(p + 4), written);
+            }
+            if (!poll_insn(s, written)) return false;
+        }
+        return false;
+    }
+
+    // A waiting loop: the branch at i goes back to t over a straight line that only reads memory and works on general
+    // registers (poll_insn), with calls of poll_leaf functions in it. A turn of such a loop changes nothing but the
+    // registers it writes, so once those are the same at the end of a turn as at its start, with no access to the
+    // hardware, system call or event in between, every further turn is the same as well: spin_turn() (runtime hw.cpp)
+    // then moves the clock forward by whole turns. Returns the registers a turn writes (bit n for r[n]), or nothing when
+    // the branch is anything else.
+    static constexpr int kPollMax = 16;
+    std::optional<std::uint32_t> poll_loop(const Insn &i, const Insn &ds) const {
+        if (poll_off_) return std::nullopt;
+        switch (i.op) {
+        case Beq: case Bne: case Blez: case Bgtz: case Bltz: case Bgez: case Beql: case Bnel: case Blezl: case Bgtzl: case Bltzl: case Bgezl:
+            break;
+        default:
+            return std::nullopt;
+        }
+        const std::uint32_t t = i.branch_target(), a = i.pc;
+        if (t > a || !in_unit(t) || !have_label(t) || !plain_code(a) || !plain_code(a + 4)) return std::nullopt;
+        std::uint32_t written = 0;
+        int count = 2;
+        if (!poll_insn(ds, written)) return std::nullopt;
+        for (std::uint32_t p = t; p < a;) {
+            if (!plain_code(p) || ++count > kPollMax * 2) return std::nullopt;
+            const Insn s = at(p);
+            if (s.op == Jal) {
+                if (dynamic_jump(p) || p + 4 >= a || !plain_code(p + 4) || !poll_insn(at(p + 4), written)) return std::nullopt;
+                if (!poll_leaf(s.jump_target(), written, count)) return std::nullopt;
+                written |= 1u << 31;
+                p += 8;
+                continue;
+            }
+            if (!poll_insn(s, written)) return std::nullopt;
+            p += 4;
+        }
+        if (count > kPollMax * 2) return std::nullopt;
+        // A register the turn steps (`addiu rX, rX, k`, k not 0) and writes nowhere else is different after every turn: such a loop
+        // counts or walks memory (a delay loop, a strlen) and never repeats, so it is left alone.
+        std::uint32_t stepped = 0, others = 0;
+        const auto note = [&](const Insn &s) {
+            std::uint32_t w = 0;
+            if (!poll_insn(s, w)) return;
+            const bool step = (s.op == Addiu || s.op == Daddiu) && s.rs() == s.rt() && s.simm() != 0;
+            (step && !(stepped & w) ? stepped : others) |= w;
+        };
+        note(ds);
+        for (std::uint32_t p = t; p < a; p += 4) {
+            const Insn s = at(p);
+            if (s.op == Jal) {
+                others |= 1u << 31;
+                note(at(p + 4));
+                for (std::uint32_t q = s.jump_target(); plain_code(q); q += 4) {
+                    const Insn x = at(q);
+                    if (x.op == Jr) {
+                        note(at(q + 4));
+                        break;
+                    }
+                    note(x);
+                }
+                p += 4;
+                continue;
+            }
+            note(s);
+        }
+        if (stepped & ~others & ~1u) return std::nullopt;
+        return written & ~1u;
+    }
+
     void control(const Insn &i, const Insn &ds) {
         const std::uint32_t a = i.pc, ret = a + 8;
         const std::uint32_t cost = pending_ + 2;
@@ -598,12 +704,17 @@ private:
         default:
             break;
         }
+        // A waiting loop (poll_loop) tells the runtime about every turn it starts again, with the registers a turn writes.
+        std::string spin;
+        if (const auto written = poll_loop(i, ds)) spin = std::format("spin_turn(c, {}, {}u); ", pc(a), *written);
         switch (flow(i.op)) {
         case Flow::Branch:
-            line(std::format("{{ const bool t = {}; {} if (t) {{ {} }} }}", condition(i), slot, jump(t, a)));
+            line(std::format("{{ const bool t = {}; {} if (t) {{ {}{} }} }}", condition(i), slot, spin, jump(t, a)));
+            if (!spin.empty()) line("spin_leave();");  // the loop is left: its next turn is a first one again
             break;
         case Flow::BranchLikely:
-            line(std::format("if ({}) {{ {} {} }}", condition(i), slot, jump(t, a)));
+            line(std::format("if ({}) {{ {} {}{} }}", condition(i), slot, spin, jump(t, a)));
+            if (!spin.empty()) line("spin_leave();");
             break;
         case Flow::Jump:
             line(std::format("{{ {} {} }}", slot, jump(t, a)));
@@ -1074,6 +1185,7 @@ private:
     bool flags_dead_{};  // the instruction simple() is writing sets vector-unit flags that nothing can see (vu0_flags_unseen)
     const bool vu0_old_ = [] { const char *e = std::getenv("PS2_VU0_HELPERS"); return e && std::string_view(e) == "old"; }();
     const bool countdown_off_ = [] { const char *e = std::getenv("PS2_EE_COUNTDOWN"); return e && std::string_view(e) == "0"; }();
+    const bool poll_off_ = [] { const char *e = std::getenv("PS2_EE_POLL"); return e && std::string_view(e) == "0"; }();
     std::size_t unserved_{};  // branch targets without a label that left through the dispatcher (see unserved())
     std::string *capture_{};
     bool collecting_{};

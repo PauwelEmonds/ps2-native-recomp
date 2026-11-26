@@ -20,6 +20,8 @@ namespace ps2 {
     X(void, call, (Cpu &c, std::uint32_t target, std::uint32_t depth), (c, target, depth))                                     \
     X(void, bad_entry, (Cpu &c, std::uint32_t unit_base), (c, unit_base))                                                      \
     X(bool, preempt, (Cpu &c), (c))                                                                                            \
+    X(void, spin_turn, (Cpu &c, std::uint32_t pc, std::uint32_t written), (c, pc, written))                                    \
+    X(void, spin_leave, (), ())                                                                                                \
     X(void, syscall, (Cpu &c, std::uint32_t pc), (c, pc))                                                                      \
     X(void, breakpoint, (Cpu &c, std::uint32_t pc), (c, pc))                                                                   \
     X(void, trap, (Cpu &c, std::uint32_t pc), (c, pc))                                                                         \

@@ -46,6 +46,11 @@ void dispatch(Cpu &c, std::uint32_t entry, std::uint32_t depth);
 void call(Cpu &c, std::uint32_t target, std::uint32_t depth);
 void bad_entry(Cpu &c, std::uint32_t unit_base);
 bool preempt(Cpu &c);
+// A waiting loop of the translator's (recomp/codegen.cpp, poll_loop) starts another turn at its branch `pc`; `written`: the general
+// registers a turn writes (bit n for r[n]). Once turns are found to repeat exactly, whole turns are skipped (runtime/src/hw.cpp).
+void spin_turn(Cpu &c, std::uint32_t pc, std::uint32_t written);
+// Where such a loop is left: two calls of spin_turn only count as two turns in a row when nothing but the loop ran between them.
+void spin_leave();
 
 void syscall(Cpu &c, std::uint32_t pc);
 void breakpoint(Cpu &c, std::uint32_t pc);

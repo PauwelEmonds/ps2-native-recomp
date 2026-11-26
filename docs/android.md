@@ -51,6 +51,22 @@ The picture look starts as "crisp + smooth edges" on Android: the sharp looks co
 For tests, the launcher takes extras: `args` (more options) and `env` (PS2_ variables), for example
 `adb shell "am start -n ps2native.<name>/ps2native.app.LauncherActivity -e env 'PS2_SCALE=2'"`.
 
+## Profiling
+
+The app is `profileable` (AndroidManifest.xml), so the phone's own sampler sees the release build over adb, without root:
+
+```
+adb shell "simpleperf record --app ps2native.<name> -f 2000 --duration 20 -o /data/local/tmp/perf.data"
+adb pull /data/local/tmp/perf.data
+python <ndk>/simpleperf/binary_cache_builder.py -i perf.data -lib <dir with the unstripped libmain.so>
+<ndk>/simpleperf/bin/<host>/simpleperf report -i perf.data --symfs binary_cache --sort comm,symbol
+```
+
+The unstripped library is `android/app/build/intermediates/cxx/Release/*/obj/arm64-v8a/libmain.so`; `--sort vaddr_in_file` with
+`llvm-addr2line -i` on it finds the hot lines of the translated code. In THPS4 that showed the game waiting for a flag in
+a loop of a few instructions for two thirds of the emulation thread, which the waiting-loop skip now passes over
+(runtime/src/hw.cpp, spin_turn).
+
 ## What is different from the PC
 
 - No compiler on the phone: code or vector programs the PC build did not see are not translated while playing. Vector

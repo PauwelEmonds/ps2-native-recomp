@@ -64,6 +64,9 @@ std::uint32_t read_intc_stat();
 // Counts the memory accesses that went the slow way (hardware registers, scratch memory of the vector units, ...) and system calls: a
 // waiting loop is only skipped when none happened between two of its reads
 extern std::uint64_t g_slow_seq;
+// Counts the events run (system.cpp, run_due_events): a waiting loop of the translated code (spin_turn) is only skipped when none ran
+// between its turns
+extern std::uint64_t g_event_seq;
 // Cycles of waiting loops skipped so far (for the line at the end of a run)
 std::uint64_t spin_skipped_cycles();
 void write32(std::uint32_t a, std::uint32_t v);

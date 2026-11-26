@@ -135,6 +135,7 @@ void run_due_events() {
         if (it == g_events.end() || it->at > t) return;
         auto action = std::move(it->action);
         g_events.erase(it);
+        ++hw::g_event_seq;
         action();
     }
 }
@@ -482,7 +483,9 @@ std::uint64_t scheduled_at(int event) {
 bool preempt(Cpu &c) {
     run_due_events();
     refill(c);
-    return g_halted || g_state_request || g_state_operation.load(std::memory_order_relaxed) || kernel::must_unwind();
+    const bool unwind = g_halted || g_state_request || g_state_operation.load(std::memory_order_relaxed) || kernel::must_unwind();
+    if (unwind) ++hw::g_event_seq;  // another thread may run before the loop goes on: no waiting-loop skip across this (hw.cpp)
+    return unwind;
 }
 
 void halt(const std::string &reason) {
