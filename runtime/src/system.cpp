@@ -525,12 +525,15 @@ std::function<void()> event_action(int id, std::uint64_t at) {
 }
 
 std::atomic<std::uint32_t> g_vu_fence{0};
+double g_vu_wait_ms = 0;  // the emulation thread's waits for the vector thread (PS2_PRESENT_LOG)
 
 void sync_vu_thread() {
     if (!gs::queue::vu_active()) return;
+    const auto start = std::chrono::steady_clock::now();
     const std::uint32_t seen = g_vu_fence.load();
     gs::queue::vu().post(gs::queue::kVuFence, 0, 0, nullptr, 0);
     while (g_vu_fence.load() == seen) gs::queue::wait(g_vu_fence, seen);
+    g_vu_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
 void machine_state(state::Stream &s) {
@@ -969,6 +972,7 @@ bool take_vu_signals_waiting() {
 std::atomic<double> g_vu_idle_ms{0.0};
 
 double vu_thread_idle_ms() { return g_vu_idle_ms.load(); }
+double vu_wait_ms() { return g_vu_wait_ms; }
 std::uint64_t vu1_interpreted_calls() { return vu::interpreted_calls(); }
 
 void run_vu_thread() {

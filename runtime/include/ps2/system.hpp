@@ -158,6 +158,7 @@ void drain_vu_thread();
 bool take_vu_signals_waiting();
 void run_vu_thread();
 double vu_thread_idle_ms();
+double vu_wait_ms();  // how long the emulation thread has waited for the vector thread, in all (emulation thread only)
 std::uint64_t vu1_interpreted_calls();
 void post_present();
 std::uint32_t picture_frame();  // the emulation frame of the picture render_pending is presenting now

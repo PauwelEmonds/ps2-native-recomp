@@ -4315,6 +4315,9 @@ bool init(Mode m) {
     // default), 2 sharpest
     if (const char *sharp = std::getenv("PS2_SHARP_2D")) g_sharp_2d = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(sharp)), 0u, 2u);
     g_copy_words = (1u << 20) * g_scale * g_scale;
+    // An Arm Mali takes 4-pixel tiles: fewer shapes in each tile's list that miss the tile's pixels (THPS4 level on a Mali-G68: 29.7 ms
+    // of drawing a picture with 4, 32.1 with 8; the pictures are the same)
+    if (g_vendor_id == 0x13B5) g_tile = 4;
     if (const int tile = std::atoi(os::env("PS2_TILE").c_str()); tile == 4 || tile == 8 || tile == 16) g_tile = tile;
     g_strips = os::env("PS2_GPU_STRIPS") == "1";
     // PS2_GPU_STRIPS_RATIO: a batch gets lists per strip when they hold at most this many times the entries of its lists per tile (4 or more: always)

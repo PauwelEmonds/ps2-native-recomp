@@ -112,6 +112,10 @@ const T_OFFZ16: u32 = 12288u;
 const T_OFFZ16S: u32 = 16384u;
 const T_OFF8: u32 = 20480u;
 const T_OFF4: u32 = 28672u;
+const T_INV32: u32 = 45056u;  // the pixels of each word of a block (gs.cpp, swizzle_tables): 64 for 32-bit blocks,
+const T_INV16: u32 = 45120u;  // 128 for 16-bit,
+const T_INV8: u32 = 45248u;   // 256 for 8-bit,
+const T_INV4: u32 = 45504u;   // 512 for 4-bit
 
 const CLUT_ENTRIES: u32 = 512u;
 
@@ -301,81 +305,85 @@ fn cache_bits_at(offset: u32, bit: u32, count: u32) -> u32 {
 // value through the same write as before; only which thread does it changes. The squares make the threads that run side by side write
 // neighbouring places of graphics memory (a 32-bit texture's 8 x 8 block is 256 bytes in a row), and the search for the record and the
 // division of a pixel's number by the row width are done once per square instead of once per pixel.
-var<workgroup> up_value: array<atomic<u32>, 64>;
-var<workgroup> up_mask: array<atomic<u32>, 64>;
-
 // prm(3) = 2 (gpu.cpp emit_pre, at scale 1): each workgroup takes one 256-byte block of graphics memory that a record writes, in the
 // record's format (8 x 8 pixels of 32 bits, 16 x 8 of 16, 16 x 16 of 8, 32 x 16 of 4; word 15 of the record holds that width and,
-// shifted by 16, that height; words 11 to 14 as with prm(3) = 1, counted in these blocks). The threads gather the block's pixels into
-// its 64 words in workgroup memory and then write each word once: whole, or only the bits the record covers. The pixel-by-pixel way
-// changes graphics memory with an atomic read and change for every pixel of fewer than 32 bits, 8 of them for one word of a 4-bit
-// texture; on a Mali-G68 THPS4's uploads (5 million pixels a picture) took 15 ms that way, two thirds of it in those writes. Each word
-// gets the same bits as before. The records of one command never write the same bits (emit_pre keeps uploads that share a block in
+// shifted by 16, that height; words 11 to 14 as with prm(3) = 1, counted in these blocks), and each of its 64 threads one word of the
+// block: it reads the pixels that lie in that word (the T_INV tables), puts them together and writes the word once, whole, or only
+// the bits the record covers in it. The pixel-by-pixel way changes graphics memory with an atomic read and change for every pixel of
+// fewer than 32 bits, 8 of them for one word of a 4-bit texture; on a Mali-G68 THPS4's uploads (5 million pixels a picture) took 15 ms
+// that way. (Gathering the pixels in workgroup memory instead took 10 ms: a Mali has no faster memory for a workgroup.) Each word gets
+// the same bits as before. The records of one command never write the same bits (emit_pre keeps uploads that share a block in
 // separate commands, unless they are the same place's disjoint rectangles or parts of one image), so a word's covered bits are this
-// workgroup's alone, and the bits it leaves alone keep whatever another workgroup writes there.
+// thread's alone, and the bits it leaves alone keep whatever another thread writes there.
 fn upload_blocks(wid: vec3<u32>, lid: u32) {
     let g = wid.x + wid.y * 1024u;
-    let inside = g < prm(2u);
-    atomicStore(&up_value[lid], 0u);
-    atomicStore(&up_mask[lid], 0u);
-    workgroupBarrier();
-    var base = 0u;
-    if (inside) {
-        let records = prm(0u);
-        var lo = 0u;
-        var hi = prm(1u);
-        while (hi - lo > 1u) {
-            let mid = (lo + hi) / 2u;
-            if (data[records + mid * 16u + 11u] <= g) {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        let r = records + lo * 16u;
-        let psm = data[r + 2u];
-        let wide = data[r + 15u] & 0xFFFFu;
-        let high = data[r + 15u] >> 16u;
-        let b = g - data[r + 11u];
-        let across = data[r + 14u];
-        let row = b / across;
-        let bx = (data[r + 12u] + b - row * across) * wide;
-        let by = (data[r + 13u] + row) * high;
-        base = locate(psm, data[r], data[r + 1u], bx & 0x7FFu, by & 0x7FFu).word & ~63u;
-        let rrw = data[r + 5u];
-        let bpp = data[r + 10u] & 0xFFu;
-        let cached = (data[r + 10u] & 0x80000000u) != 0u;
-        for (var i = lid; i < wide * high; i = i + 64u) {
-            let ux = bx + i % wide;
-            let uy = by + i / wide;
-            let dx = ux - data[r + 3u];
-            let dy = uy - data[r + 4u];
-            let k = dy * rrw + dx - data[r + 6u];
-            if (dx < rrw && dy <= 0x7FFu && k < data[r + 7u]) {
-                var v = 0u;
-                if (cached) {
-                    v = cache_bits_at(data[r + 8u], data[r + 9u] + k * bpp, bpp);
-                } else {
-                    v = bits_at(data[r + 8u], data[r + 9u] + k * bpp, bpp);
-                }
-                let l = locate(psm, data[r], data[r + 1u], ux & 0x7FFu, uy & 0x7FFu);
-                atomicOr(&up_value[l.word & 63u], (v & l.mask) << l.shift);
-                atomicOr(&up_mask[l.word & 63u], l.mask << l.shift);
-            }
+    if (g >= prm(2u)) {
+        return;
+    }
+    let records = prm(0u);
+    var lo = 0u;
+    var hi = prm(1u);
+    while (hi - lo > 1u) {
+        let mid = (lo + hi) / 2u;
+        if (data[records + mid * 16u + 11u] <= g) {
+            lo = mid;
+        } else {
+            hi = mid;
         }
     }
-    workgroupBarrier();
-    let m = atomicLoad(&up_mask[lid]);
-    if (inside && m != 0u) {
-        let w = base + lid;
-        let value = atomicLoad(&up_value[lid]);
-        if (m == 0xFFFFFFFFu) {
-            atomicStore(&vram[w], value);
-        } else {
-            let flip = (atomicLoad(&vram[w]) ^ value) & m;
-            if (flip != 0u) {
-                atomicXor(&vram[w], flip);
+    let r = records + lo * 16u;
+    let psm = data[r + 2u];
+    let wide = data[r + 15u] & 0xFFFFu;
+    let high = data[r + 15u] >> 16u;
+    let b = g - data[r + 11u];
+    let across = data[r + 14u];
+    let row = b / across;
+    let bx = (data[r + 12u] + b - row * across) * wide;
+    let by = (data[r + 13u] + row) * high;
+    let rrw = data[r + 5u];
+    let bpp = data[r + 10u] & 0xFFu;
+    let cached = (data[r + 10u] & 0x80000000u) != 0u;
+    let per = wide * high / 64u;  // pixels in a word: 1, 2, 4 or 8
+    var table = T_INV32;
+    if (per == 2u) {
+        table = T_INV16;
+    } else if (per == 4u) {
+        table = T_INV8;
+    } else if (per == 8u) {
+        table = T_INV4;
+    }
+    var value = 0u;
+    var m = 0u;
+    var w = 0xFFFFFFFFu;
+    for (var i = 0u; i < per; i = i + 1u) {
+        let at = tables[table + lid * per + i];
+        let ux = bx + (at & 0xFFu);
+        let uy = by + (at >> 8u);
+        let dx = ux - data[r + 3u];
+        let dy = uy - data[r + 4u];
+        let k = dy * rrw + dx - data[r + 6u];
+        if (dx < rrw && dy <= 0x7FFu && k < data[r + 7u]) {
+            var v = 0u;
+            if (cached) {
+                v = cache_bits_at(data[r + 8u], data[r + 9u] + k * bpp, bpp);
+            } else {
+                v = bits_at(data[r + 8u], data[r + 9u] + k * bpp, bpp);
             }
+            let l = locate(psm, data[r], data[r + 1u], ux & 0x7FFu, uy & 0x7FFu);
+            value = value | ((v & l.mask) << l.shift);
+            m = m | (l.mask << l.shift);
+            w = l.word;
+        }
+    }
+    if (m == 0u) {
+        return;
+    }
+    if (m == 0xFFFFFFFFu) {
+        atomicStore(&vram[w], value);
+    } else {
+        let flip = (atomicLoad(&vram[w]) ^ value) & m;
+        if (flip != 0u) {
+            atomicXor(&vram[w], flip);
         }
     }
 }

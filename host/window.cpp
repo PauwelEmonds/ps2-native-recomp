@@ -1625,15 +1625,19 @@ struct WaitLog {
     using Clock = std::chrono::steady_clock;
     bool on = std::getenv("PS2_PRESENT_LOG") != nullptr;
     Clock::time_point since = Clock::now();
-    double post = 0, sound = 0, seen_working = 0, seen_idle = 0;
+    double post = 0, sound = 0, seen_working = 0, seen_idle = 0, seen_vu_wait = 0, seen_vu_idle = 0;
     std::atomic<double> working{0}, idle{0};  // written by the window thread, read by the emulation thread
     std::uint32_t frames = 0;
     static double ms(Clock::time_point from) { return std::chrono::duration<double, std::milli>(Clock::now() - from).count(); }
     void emulation_frame() {
         if (++frames < 60) return;
         const double seconds = std::chrono::duration<double>(Clock::now() - since).count();
-        std::fprintf(stderr, "[waits] %.1f frames/s; emulation thread per frame: waiting for the window thread %.2f ms, for the sound %.2f ms; window thread per second: rendering %.0f ms, no work %.0f ms\n",
-                     frames / seconds, post / frames, sound / frames, (working.load() - seen_working) / seconds, (idle.load() - seen_idle) / seconds);
+        const double vu_wait = ps2::vu_wait_ms(), vu_idle = ps2::vu_thread_idle_ms();
+        std::fprintf(stderr, "[waits] %.1f frames/s; emulation thread per frame: waiting for the window thread %.2f ms, for the sound %.2f ms, for the vector thread %.2f ms; window thread per second: rendering %.0f ms, no work %.0f ms; vector thread idle %.0f ms a second\n",
+                     frames / seconds, post / frames, sound / frames, (vu_wait - seen_vu_wait) / frames, (working.load() - seen_working) / seconds, (idle.load() - seen_idle) / seconds,
+                     (vu_idle - seen_vu_idle) / seconds);
+        seen_vu_wait = vu_wait;
+        seen_vu_idle = vu_idle;
         since = Clock::now();
         post = sound = 0;
         seen_working = working.load();

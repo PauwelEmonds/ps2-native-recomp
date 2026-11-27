@@ -62,8 +62,10 @@ A phone's graphics chip is usually what limits a game here, so on Android the fr
 off, `PS2_FRAMESKIP=1` turns it on elsewhere; runtime/src/gs/gs.cpp): while the game is more than half a frame behind the
 clock, the next picture is not drawn and not shown, at most three in a row; uploads, copies and palettes still go to graphics
 memory. The game's own frames are not held up by the pictures left out. On the Galaxy A54 a THPS4 level costs the Mali-G68
-about 45 ms a picture (drawing 32, texture uploads 10): the game runs at 37 to 43 of its 50 frames a second there, and about
-14 pictures a second are shown.
+about 41 ms a picture (drawing 30, texture uploads 8, which also run for the pictures left out): the game runs at 47 to 50 of
+its 50 frames a second there, and 12 to 17 pictures a second are shown. An Arm Mali draws in tiles of 4 x 4 pixels instead of
+8 x 8 (gpu.cpp; `PS2_TILE` sets it). `PS2_PRESENT_LOG=1` writes a `[waits]` line every 60 frames with what the emulation thread
+waited for (the window thread, the sound, the vector unit thread).
 
 For tests, the launcher takes extras: `args` (more options) and `env` (PS2_ variables), for example
 `adb shell "am start -n ps2native.<name>/ps2native.app.LauncherActivity -e env 'PS2_SCALE=2'"`.

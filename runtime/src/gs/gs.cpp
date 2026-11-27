@@ -446,6 +446,20 @@ void swizzle_tables(std::vector<std::uint32_t> &out) {
     for (auto &row : g_offz16s) out.insert(out.end(), std::begin(row), std::end(row));
     for (auto &row : g_off8) out.insert(out.end(), std::begin(row), std::end(row));
     for (auto &row : g_off4) out.insert(out.end(), std::begin(row), std::end(row));
+    // Then, for the upload program's blocks (gs.wgsl, upload_blocks), which pixels of a block lie in each of its 64 words: for a
+    // 32-bit block (8 x 8) one per word, 16-bit (16 x 8) two, 8-bit (16 x 16) four, 4-bit (32 x 16) eight, as x | y << 8 within the
+    // block, in the order of their place in the word. The layout inside a block is the same in every block of a format (and of its
+    // depth and 16S variants), so the top-left block of the page tables gives it.
+    std::vector<std::uint32_t> inv32(64), inv16(128), inv8(256), inv4(512);
+    for (std::uint32_t y = 0; y < 8; ++y)
+        for (std::uint32_t x = 0; x < 8; ++x) inv32[g_off32[y][x] / 4] = x | y << 8;
+    for (std::uint32_t y = 0; y < 8; ++y)
+        for (std::uint32_t x = 0; x < 16; ++x) inv16[g_off16[y][x] / 4 * 2 + (g_off16[y][x] / 2 & 1)] = x | y << 8;
+    for (std::uint32_t y = 0; y < 16; ++y)
+        for (std::uint32_t x = 0; x < 16; ++x) inv8[g_off8[y][x] / 4 * 4 + (g_off8[y][x] & 3)] = x | y << 8;
+    for (std::uint32_t y = 0; y < 16; ++y)
+        for (std::uint32_t x = 0; x < 32; ++x) inv4[g_off4[y][x] / 8 * 8 + (g_off4[y][x] & 7)] = x | y << 8;
+    for (const auto *t : {&inv32, &inv16, &inv8, &inv4}) out.insert(out.end(), t->begin(), t->end());
 }
 
 // The base pointer (in 256-byte blocks) and buffer width of mip levels 0 to 6 (GS User's Manual: TEX0, TEX1 MTBA, MIPTBP1/2; docs/mipmap.md).
@@ -1816,6 +1830,8 @@ bool frameskip_on() {
 bool skip_next_picture() {
     if (!frameskip_on() || !gpu_on() || cpu_raster()) return false;
     const std::uint32_t shown = g_presented.load() + 1;  // this one counts as shown once render_pending pops it
+    // (waiting for two pictures instead drew more of them, 15 to 17 a second in a THPS4 level on a Mali-G68, but the game fell to 36 to
+    // 45 frames a second; with one it stays at 50 and shows 12 or 13)
     const bool behind = g_running_late.load(std::memory_order_relaxed) || static_cast<std::int32_t>(g_posted_presents.load(std::memory_order_relaxed) - shown) > 0;
     if (!behind || g_skipped_in_row >= kMaxSkipped) {
         g_skipped_in_row = 0;
