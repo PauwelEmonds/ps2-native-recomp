@@ -118,6 +118,9 @@ std::uint32_t present_frame();  // the emulation frame the picture that is being
 Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_present, double budget_ms);
 double gpu_busy_ms();
 std::uint64_t primitives_drawn();
+std::uint64_t skipped_pictures();  // pictures the frame skip left out (render_pending)
+void set_running_late(bool late);    // the emulation is not ahead of the clock (the window's pace): the frame skip leaves pictures out
+bool frameskip_on();                 // PS2_FRAMESKIP (on by default on Android)
 void stats();
 
 }

@@ -8,6 +8,8 @@ import android.content.Intent;
 import android.os.Bundle;
 import android.system.Os;
 import android.util.Log;
+import android.view.Display;
+import android.view.WindowManager;
 
 import org.libsdl.app.SDLActivity;
 
@@ -32,6 +34,34 @@ public class GameActivity extends SDLActivity {
         // the game's own switches (games/<name>/env.txt on the PC, baked in by build.gradle); an "env" extra wins
         if (!BuildConfig.GAME_ENV.isEmpty()) setEnv(BuildConfig.GAME_ENV.split("\n"), false);
         super.onCreate(savedInstanceState);
+        fastestRefresh();
+    }
+
+    // The screen's fastest refresh. A PAL game makes 50 pictures a second, an NTSC one 60; on a 60 Hz screen a PAL game's every
+    // fifth picture stays twice as long (33 ms instead of 17, ten times a second: the motion jerks). At 120 Hz the pictures stay
+    // 17 or 25 ms, and a new picture waits less for the screen. PS2_REFRESH=<hz> asks for that rate instead (60: the phone's choice).
+    private void fastestRefresh() {
+        try {
+            Display display = getWindowManager().getDefaultDisplay();
+            Display.Mode now = display.getMode();
+            float want = 0;
+            String asked = System.getenv("PS2_REFRESH");
+            if (asked != null && !asked.isEmpty()) want = Float.parseFloat(asked);
+            Display.Mode best = null;
+            for (Display.Mode m : display.getSupportedModes()) {
+                if (m.getPhysicalWidth() != now.getPhysicalWidth() || m.getPhysicalHeight() != now.getPhysicalHeight()) continue;
+                boolean better = best == null || (want > 0 ? Math.abs(m.getRefreshRate() - want) < Math.abs(best.getRefreshRate() - want)
+                                                           : m.getRefreshRate() > best.getRefreshRate());
+                if (better) best = m;
+            }
+            if (best == null) return;
+            WindowManager.LayoutParams p = getWindow().getAttributes();
+            p.preferredDisplayModeId = best.getModeId();
+            getWindow().setAttributes(p);
+            Log.i(LauncherActivity.TAG, "screen refresh: asked for " + best.getRefreshRate() + " Hz (was " + now.getRefreshRate() + " Hz)");
+        } catch (Exception e) {
+            Log.w(LauncherActivity.TAG, "screen refresh: " + e);
+        }
     }
 
     @Override

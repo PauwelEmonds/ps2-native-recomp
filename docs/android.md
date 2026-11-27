@@ -21,6 +21,10 @@ cd android
 ./gradlew assembleRelease -Pps2Game=<name> -Pps2Title="<title>"
 ```
 
+The app's icon is `games/<name>/icon.png` when there is one (for example the cover, cut to the picture; `games/` is never
+committed): the build makes it square by stretching its edge rows or columns and makes an adaptive icon of it. Without it the
+app has Android's plain icon.
+
 The APK is `android/app/build/outputs/apk/release/app-release.apk`, signed with the debug key (fine for installing it
 yourself; `-Pps2Keystore=... -Pps2KeyAlias=... -Pps2KeyPassword=...` signs it with your own). `-Pps2Abis=arm64-v8a,x86_64`
 adds the Android emulator. The game code is always compiled optimised and with `-ffp-contract=off` (ARM always has FMA,
@@ -33,7 +37,8 @@ which would change the vector units' results: scripts/cxx.sh).
    permission), or copy it into the app's folder:
    `adb push game.iso /sdcard/Android/data/ps2native.<name>/files/<name>.iso`
 3. The same folder holds the memory card (`<name>.ps2`), `keys.ini`, quick saves, reports and `log.txt`; the log also
-   goes to logcat: `adb logcat -s ps2native`. Every 5 seconds a `[speed]` line gives the frames per second. A new memory
+   goes to logcat: `adb logcat -s ps2native`. Every 5 seconds a `[speed]` line gives the frames per second, and with the frame
+   skip (below) how many of their pictures were shown, as `38.2 fps (14 shown)`. A new memory
    card starts formatted and empty (on every platform), so the game saves on it without asking to format it first
    (`PS2_MEMCARD_BLANK=1` gives the unformatted card of a new console card instead).
 
@@ -41,12 +46,24 @@ On the screen are touch controls, a PS2 controller (host/touch.cpp; the model is
 where the left thumb lands on the left half (pushed far it also presses the d-pad, for menus that read only that), triangle
 circle cross square on the right, L1 L2 and R1 R2 in the top corners, SELECT and START at the top and beside them a button
 that opens the quick menu (save, load, look; a tap on an entry chooses it, a tap beside them goes back). Every press lasts at
-least 200 ms, since a game's menus may miss a quicker tap. A game controller (Bluetooth or USB, any controller SDL knows) or a
+least 2 frames of the game, so that a tap shorter than a frame still reaches it, and no longer (THPS4 repeats a held direction
+in its menus and ollies when cross is let go). A game controller (Bluetooth or USB, any controller SDL knows) or a
 keyboard (`keys.ini`) works too; the touch controls hide while one is used and come back at the next touch. On a computer
 `PS2_TOUCH=1` shows them, with the left mouse button as the finger.
 
-The picture look starts as "crisp + smooth edges" on Android: the sharp looks cost the phone's graphics chip too much
-(on a Mali-G68 the THPS4 menu ran at ~30 fps with "sharp + smooth edges", 50 with the crisp or soft looks).
+The app asks for the screen's fastest refresh (GameActivity.java): a PAL game's 50 pictures a second on a 60 Hz screen show
+every fifth picture twice as long, ten jerks a second; at 120 Hz they stay 17 or 25 ms. `PS2_REFRESH=60` asks for 60 Hz instead.
+
+The picture look starts as "crisp" on Android: the sharp looks cost the phone's graphics chip too much (on a Mali-G68 the
+THPS4 menu ran at ~30 fps with "sharp + smooth edges", 50 with the crisp or soft looks), and the smoothed edges cost it 4.5 ms
+a picture in a THPS4 level. A keys.ini written by an older build keeps the look it names (`look = crisp_edges`).
+
+A phone's graphics chip is usually what limits a game here, so on Android the frame skip is on (`PS2_FRAMESKIP=0` turns it
+off, `PS2_FRAMESKIP=1` turns it on elsewhere; runtime/src/gs/gs.cpp): while the game is more than half a frame behind the
+clock, the next picture is not drawn and not shown, at most three in a row; uploads, copies and palettes still go to graphics
+memory. The game's own frames are not held up by the pictures left out. On the Galaxy A54 a THPS4 level costs the Mali-G68
+about 45 ms a picture (drawing 32, texture uploads 10): the game runs at 37 to 43 of its 50 frames a second there, and about
+14 pictures a second are shown.
 
 For tests, the launcher takes extras: `args` (more options) and `env` (PS2_ variables), for example
 `adb shell "am start -n ps2native.<name>/ps2native.app.LauncherActivity -e env 'PS2_SCALE=2'"`.

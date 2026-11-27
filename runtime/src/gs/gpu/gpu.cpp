@@ -543,6 +543,80 @@ bool uploads_overlap(const PreOp &a, const PreOp &b) {
     return a.x0 <= b.x1 && b.x0 <= a.x1 && a.y0 <= b.y1 && b.y0 <= a.y1;
 }
 
+// The 256-byte blocks of graphics memory that a rectangle of pixels of a format lies in (the GS's block and page layout: 32 blocks a
+// page, the blocks of a page in the order of the format's table). uploads_overlap above works in whole pages for uploads of two
+// different places, and games pack small textures and palettes into the blocks of one page (THPS4 about 1,400 uploads a picture, of
+// which 870 then counted as overlapping an earlier one: every one a dispatch of its own, about 16 ms a picture of a Mali-G68's time).
+// Two uploads that share no block cannot share a byte. Blocks are numbered within the 4 MB memory (16,384); false when the rectangle
+// runs past the 2048 x 2048 space (it wraps there), which the caller takes as "may touch anything".
+const std::uint8_t kBlocks32[4][8] = {{0, 1, 4, 5, 16, 17, 20, 21}, {2, 3, 6, 7, 18, 19, 22, 23}, {8, 9, 12, 13, 24, 25, 28, 29}, {10, 11, 14, 15, 26, 27, 30, 31}};
+const std::uint8_t kBlocksZ32[4][8] = {{24, 25, 28, 29, 8, 9, 12, 13}, {26, 27, 30, 31, 10, 11, 14, 15}, {16, 17, 20, 21, 0, 1, 4, 5}, {18, 19, 22, 23, 2, 3, 6, 7}};
+const std::uint8_t kBlocks16[8][4] = {{0, 2, 8, 10}, {1, 3, 9, 11}, {4, 6, 12, 14}, {5, 7, 13, 15}, {16, 18, 24, 26}, {17, 19, 25, 27}, {20, 22, 28, 30}, {21, 23, 29, 31}};
+const std::uint8_t kBlocks16S[8][4] = {{0, 2, 16, 18}, {1, 3, 17, 19}, {8, 10, 24, 26}, {9, 11, 25, 27}, {4, 6, 20, 22}, {5, 7, 21, 23}, {12, 14, 28, 30}, {13, 15, 29, 31}};
+const std::uint8_t kBlocksZ16[8][4] = {{24, 26, 16, 18}, {25, 27, 17, 19}, {28, 30, 20, 22}, {29, 31, 21, 23}, {8, 10, 0, 2}, {9, 11, 1, 3}, {12, 14, 4, 6}, {13, 15, 5, 7}};
+const std::uint8_t kBlocksZ16S[8][4] = {{24, 26, 8, 10}, {25, 27, 9, 11}, {16, 18, 0, 2}, {17, 19, 1, 3}, {28, 30, 12, 14}, {29, 31, 13, 15}, {20, 22, 4, 6}, {21, 23, 5, 7}};
+
+void page_size(std::uint32_t psm, std::uint32_t &pw, std::uint32_t &ph);
+
+// A block in pixels: 8 x 8 (32-bit formats and those in a 32-bit word's bits), 16 x 8 (16-bit), 16 x 16 (8-bit), 32 x 16 (4-bit).
+void block_size(std::uint32_t psm, std::uint32_t &wide, std::uint32_t &high) {
+    std::uint32_t pw, ph;
+    page_size(psm, pw, ph);
+    wide = psm == PSMT4 ? 32 : psm == PSMT8 || (pw == 64 && ph == 64) ? 16 : 8;
+    high = psm == PSMT4 || psm == PSMT8 ? 16 : 8;
+}
+
+template <typename F>
+bool for_each_block(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, std::uint32_t x0, std::uint32_t y0, std::uint32_t x1, std::uint32_t y1, F &&each) {
+    if (x1 > 2047 || y1 > 2047 || x0 > x1 || y0 > y1) return false;
+    std::uint32_t pw, ph, bwide, bhigh;
+    page_size(psm, pw, ph);
+    block_size(psm, bwide, bhigh);
+    const bool sixteen = pw == 64 && ph == 64;  // 16-bit formats: 4 blocks across a page, 8 down (and PSMT4, below)
+    const std::uint32_t per_row = std::max<std::uint32_t>(1, bw * 64 / pw);
+    for (std::uint32_t by = y0 / bhigh; by <= y1 / bhigh; ++by)
+        for (std::uint32_t bx = x0 / bwide; bx <= x1 / bwide; ++bx) {
+            const std::uint32_t page = bx * bwide / pw + by * bhigh / ph * per_row;
+            std::uint32_t in_page;
+            if (sixteen || psm == PSMT4) {
+                const std::uint32_t r = by & 7, col = bx & 3;
+                in_page = psm == PSMCT16S ? kBlocks16S[r][col] : psm == PSMZ16 ? kBlocksZ16[r][col] : psm == PSMZ16S ? kBlocksZ16S[r][col] : kBlocks16[r][col];
+            } else {
+                const std::uint32_t r = by & 3, col = bx & 7;
+                in_page = psm == PSMZ32 || psm == PSMZ24 ? kBlocksZ32[r][col] : kBlocks32[r][col];
+            }
+            each((bp + page * 32 + in_page) & 16383u);
+        }
+    return true;
+}
+
+// The blocks the uploads of the run emit_pre is putting together write, one bit each.
+struct RunBlocks {
+    std::uint64_t bits[256] = {};
+    std::vector<std::uint16_t> set;  // the words of `bits` that are not zero, to clear only those
+    bool all = false;                // an upload of the run may touch anything (for_each_block said false)
+    void clear() {
+        for (const std::uint16_t w : set) bits[w] = 0;
+        set.clear();
+        all = false;
+    }
+    bool any(const PreOp &op) {  // shares a block with the run
+        if (all) return true;
+        bool hit = false;
+        if (!for_each_block(op.rec[0], op.rec[1], op.rec[2], op.x0, op.y0, op.x1, op.y1, [&](std::uint32_t b) { hit = hit || (bits[b >> 6] >> (b & 63) & 1u); }))
+            return true;
+        return hit;
+    }
+    void add(const PreOp &op) {
+        if (all) return;
+        if (!for_each_block(op.rec[0], op.rec[1], op.rec[2], op.x0, op.y0, op.x1, op.y1, [&](std::uint32_t b) {
+                if (!bits[b >> 6]) set.push_back(static_cast<std::uint16_t>(b >> 6));
+                bits[b >> 6] |= 1ull << (b & 63);
+            }))
+            all = true;
+    }
+} g_run_blocks;
+
 // Uploads and CLUT loads run before the pending primitive batch unless they touch memory it reads or writes.
 std::vector<PreOp> g_pre;
 std::vector<Range> g_batch_reads;
@@ -2330,39 +2404,50 @@ void emit_pre() {
     while (i < g_pre.size()) {
         const bool clut = g_pre[i].clut;
         std::size_t j = i + 1;
+        if (!clut) {
+            g_run_blocks.clear();
+            g_run_blocks.add(g_pre[i]);
+        }
         while (j < g_pre.size() && g_pre[j].clut == clut) {
-            bool overlap = false;
-            if (!clut)
-                for (std::size_t k = i; k < j && !overlap; ++k) overlap = uploads_overlap(g_pre[k], g_pre[j]);
-            if (overlap) break;
+            if (!clut) {  // an upload that shares no block with the run cannot overlap it; else the old test decides (the same place: by pixels)
+                bool overlap = false;
+                if (g_run_blocks.any(g_pre[j]))
+                    for (std::size_t k = i; k < j && !overlap; ++k) overlap = uploads_overlap(g_pre[k], g_pre[j]);
+                if (overlap) break;
+                g_run_blocks.add(g_pre[j]);
+            }
             ++j;
         }
         const std::uint32_t count = static_cast<std::uint32_t>(j - i);
-        if (!clut && g_upload_blocks) {  // the uploads in 8 x 8 squares (upload in gs.wgsl, prm(3) = 1), when every record allows it
+        if (!clut && g_upload_blocks) {  // the uploads in 8 x 8 squares (upload in gs.wgsl, prm(3) = 1), when every record allows it;
+                                          // at scale 1 in the blocks of graphics memory instead (prm(3) = 2: one write per word)
             bool fits = true;
             for (std::size_t k = i; k < j && fits; ++k) fits = upload_in_squares(g_pre[k].rec);
             if (fits) {
                 std::uint32_t *records = g_arena.grow(count * 16u);
                 const std::uint32_t offset = static_cast<std::uint32_t>(records - g_arena.data());
                 std::uint32_t squares = 0;
+                const bool in_blocks = g_scale == 1;  // the block way does not keep a scaled depth buffer's finer samples (upload in gs.wgsl)
                 for (std::size_t k = i; k < j; ++k) {
                     const std::uint32_t *q = g_pre[k].rec;
                     std::uint32_t *r = records + (k - i) * 16;
                     std::memcpy(r, q, 11 * 4);
+                    std::uint32_t wide = 8, high = 8;
+                    if (in_blocks) block_size(q[2], wide, high);
                     const std::uint32_t first = q[6] / q[5], last = (q[6] + q[7] - 1) / q[5];
-                    const std::uint32_t bx0 = q[3] / 8, bx1 = (q[3] + q[5] - 1) / 8, by0 = (q[4] + first) / 8, by1 = (q[4] + last) / 8;
+                    const std::uint32_t bx0 = q[3] / wide, bx1 = (q[3] + q[5] - 1) / wide, by0 = (q[4] + first) / high, by1 = (q[4] + last) / high;
                     r[11] = squares;
                     r[12] = bx0;
                     r[13] = by0;
                     r[14] = bx1 - bx0 + 1;
-                    r[15] = 0;
+                    r[15] = in_blocks ? wide | high << 16 : 0;
                     squares += (bx1 - bx0 + 1) * (by1 - by0 + 1);
                 }
                 if (g_live) {
                     hw::live_position(static_cast<std::uint32_t>(g_commands.size()));
                     for (std::size_t k = i; k < j; ++k) hw::live_writer(g_pre[k].range.lo, g_pre[k].range.hi);
                 }
-                if (squares) g_commands.push_back({kUpload, std::min(squares, 1024u), (squares + 1023) / 1024, push_params({offset, count, squares, 1})});
+                if (squares) g_commands.push_back({kUpload, std::min(squares, 1024u), (squares + 1023) / 1024, push_params({offset, count, squares, in_blocks ? 2u : 1u})});
                 i = j;
                 continue;
             }

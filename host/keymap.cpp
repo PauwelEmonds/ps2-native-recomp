@@ -382,7 +382,7 @@ std::string default_file_text() {
         "\n# How the picture is enlarged to the window (F2 in the game goes through these and writes the choice here):\n"
         "#   sharp_edges   sharp, and the jagged stairs along edges are smoothed" + std::string(kDefaultLook == 5 ? " (the default)" : "") + "\n"
         "#   sharp         a cubic enlargement plus light sharpening: text and the health bar keep their edges (heavy for a phone)\n"
-        "#   crisp         hard pixels, only their borders blend\n"
+        "#   crisp         hard pixels, only their borders blend" + std::string(kDefaultLook == 0 ? " (the default)" : "") + "\n"
         "#   crisp_edges   crisp, and the jagged stairs along edges are smoothed" + std::string(kDefaultLook == 1 ? " (the default)" : "") + "\n"
         "#   soft          a smooth blend, like an old TV\n"
         "#   soft_edges    soft, and the jagged stairs along edges are smoothed\n"

@@ -41,10 +41,11 @@ struct Config {
 
 // The picture looks the F2 key goes through. The number is also the video option bits (ps2/video.hpp): bit 0 smooth edges, bit 1 soft, bit 2 sharp (look 4: cubic enlargement + light sharpening; look 5 = sharp + smooth edges).
 constexpr int kLookCount = 6;
-// Android starts with crisp + smooth edges: the sharp looks read 16 picture pixels per screen pixel from a storage buffer, which a phone's
-// graphics chip cannot afford (Mali-G68 at 2340x1080: ~26 ms a picture for sharp + smooth edges, ~2 ms for crisp + smooth edges).
+// Android starts with crisp: the sharp looks read 16 picture pixels per screen pixel from a storage buffer, which a phone's graphics chip
+// cannot afford (Mali-G68 at 2340x1080: ~26 ms a picture for sharp + smooth edges in a menu), and the smoothed edges cost it 4.5 ms a
+// picture in a THPS4 level (6.0 ms for crisp + smooth edges, 1.4 ms for crisp).
 #ifdef __ANDROID__
-constexpr int kDefaultLook = 1;
+constexpr int kDefaultLook = 0;
 #else
 constexpr int kDefaultLook = 5;
 #endif

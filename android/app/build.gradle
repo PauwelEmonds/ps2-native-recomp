@@ -16,6 +16,59 @@ if (!generated.isDirectory()) {
 def envFile = file("../../games/${game}/env.txt")
 def gameEnv = envFile.isFile() ? envFile.readLines().collect { it.trim() }.findAll { it.startsWith('PS2_') && it.contains('=') }.join('\n') : ''
 
+// The app's icon: games/<name>/icon.png (e.g. the cover; games/ is never committed), else Android's plain one. The picture is
+// made square (its edge rows or columns stretched over the rest, not the picture itself) and becomes an adaptive icon: a
+// launcher shows the middle 72 of its 108 dp and cuts that to its own shape, so the square fills those 72 dp, on itself
+// enlarged to the full 108 dp (seen when the launcher moves the icon).
+def iconFile = file("../../games/${game}/icon.png")
+def iconRes = file("${buildDir}/generated/ps2icon/res")
+def hasIcon = iconFile.isFile()
+if (hasIcon) {
+    def picture = javax.imageio.ImageIO.read(iconFile)
+    if (picture == null) throw new GradleException("${iconFile} is not a picture ImageIO reads (PNG)")
+    int w = picture.width, h = picture.height, side = Math.max(w, h), x0 = (side - w).intdiv(2), y0 = (side - h).intdiv(2)
+    def square = new java.awt.image.BufferedImage(side, side, java.awt.image.BufferedImage.TYPE_INT_ARGB)
+    def g = square.createGraphics()
+    g.drawImage(picture, x0, y0, null)
+    if (y0 > 0) {   // wider than high: the top row up, the bottom row down
+        g.drawImage(picture, x0, 0, x0 + w, y0, 0, 0, w, 1, null)
+        g.drawImage(picture, x0, y0 + h, x0 + w, side, 0, h - 1, w, h, null)
+    }
+    if (x0 > 0) {
+        g.drawImage(picture, 0, y0, x0, y0 + h, 0, 0, 1, h, null)
+        g.drawImage(picture, x0 + w, y0, side, y0 + h, w - 1, 0, w, h, null)
+    }
+    g.dispose()
+    def scaled = { int size ->   // in halving steps, which keeps more of a large picture than one step down
+        def image = square
+        while (image.width > size) {
+            int next = Math.max(size, image.width.intdiv(2))
+            def smaller = new java.awt.image.BufferedImage(next, next, java.awt.image.BufferedImage.TYPE_INT_ARGB)
+            def sg = smaller.createGraphics()
+            sg.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION, java.awt.RenderingHints.VALUE_INTERPOLATION_BILINEAR)
+            sg.drawImage(image, 0, 0, next, next, null)
+            sg.dispose()
+            image = smaller
+        }
+        image
+    }
+    def drawables = new File(iconRes, 'drawable-nodpi')
+    drawables.mkdirs()
+    javax.imageio.ImageIO.write(scaled(288), 'png', new File(drawables, 'game_icon.png'))   // 72 dp at 4x
+    def mipmaps = new File(iconRes, 'mipmap-anydpi-v26')
+    mipmaps.mkdirs()
+    new File(mipmaps, 'ic_launcher.xml').text = '''<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/game_icon" />
+    <foreground>
+        <inset android:drawable="@drawable/game_icon" android:inset="16.667%" />
+    </foreground>
+</adaptive-icon>
+'''
+} else {
+    iconRes.deleteDir()
+}
+
 android {
     namespace 'ps2native.app'
     compileSdk 35
@@ -28,6 +81,7 @@ android {
         versionCode 1
         versionName '0.1'
         resValue 'string', 'app_name', title
+        manifestPlaceholders = [appIcon: hasIcon ? '@mipmap/ic_launcher' : '@android:drawable/sym_def_app_icon']
         buildConfigField 'String', 'GAME', "\"${game}\""
         buildConfigField 'String', 'GAME_ENV', "\"${gameEnv.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')}\""
         ndk {
@@ -47,6 +101,9 @@ android {
     }
     buildFeatures {
         buildConfig true
+    }
+    sourceSets {
+        main.res.srcDirs += iconRes
     }
     externalNativeBuild {
         cmake {

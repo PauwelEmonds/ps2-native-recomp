@@ -305,6 +305,7 @@ void vblank() {
     ++g_frames;
     // VU1 on its own thread: the SIGNAL, FINISH and LABEL writes of the packets it kicked (PATH1) reach the GS here, once a picture,
     // after the emulation waited for the vector thread to finish what it was given; the same point in every run (gif::take_vu_signals).
+    // A waiting loop of the game takes them earlier (take_vu_signals_waiting, called from hw.cpp).
     if (gs::queue::vu_active() && gs::queue::role() == gs::queue::Role::Emulation) {
         sync_vu_thread();
         gif::take_vu_signals();
@@ -959,6 +960,12 @@ void drain_vu_thread() {
     sync_vu_thread();
 }
 
+bool take_vu_signals_waiting() {
+    if (gs::queue::role() != gs::queue::Role::Emulation || !gs::queue::vu_active()) return false;
+    if (!gs::queue::vu().empty()) sync_vu_thread();
+    return gif::take_vu_signals();
+}
+
 std::atomic<double> g_vu_idle_ms{0.0};
 
 double vu_thread_idle_ms() { return g_vu_idle_ms.load(); }
@@ -1147,6 +1154,9 @@ void browser_yield() {}
 
 std::uint64_t frames_run() { return g_frames; }
 std::uint64_t primitives_drawn() { return gs::primitives_drawn(); }
+std::uint64_t skipped_pictures() { return gs::skipped_pictures(); }
+void set_running_late(bool late) { gs::set_running_late(late); }
+bool frame_skip_on() { return gs::frameskip_on(); }
 // The host's pad state waits in g_pad_in until the next frame (latch_pads); only the values that change mark a port as changed.
 void set_pad_buttons(std::uint16_t pressed, int pad) {
     if (pad < 0 || pad > 1) return;

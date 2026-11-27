@@ -149,6 +149,13 @@ void start_vu_thread();
 // The emulation thread is about to read or write the memory of VU1 itself: wait until the vector unit thread has done what was posted
 // to it (VIF1 packets, programs), as the console would have by then. Nothing happens without that thread or when it has nothing to do.
 void drain_vu_thread();
+// The emulation thread waits in a loop (hw.cpp: a waiting loop it is about to skip turns of): the loop may wait for a SIGNAL or FINISH
+// in the packets VU1 kicks. With VU1 on its own thread those reach the GS only when the emulation thread takes them over (gif.cpp,
+// take_vu_signals), else once a picture, at the refresh; a game that waits for one at every stage of its picture then draws one stage
+// a refresh (THPS4: about 21 a picture, so a new picture every 21 refreshes). So the loop first waits for the vector thread to finish
+// what it was given and takes its writes over. The loop is found by the game's own state, so it happens at the same point in every
+// run, and what the vector thread was given by then is the same too. True when there were writes (an interrupt may be due).
+bool take_vu_signals_waiting();
 void run_vu_thread();
 double vu_thread_idle_ms();
 std::uint64_t vu1_interpreted_calls();
@@ -167,6 +174,10 @@ double gpu_busy_ms();
 void browser_yield();
 std::uint64_t frames_run();
 std::uint64_t primitives_drawn();
+std::uint64_t skipped_pictures();  // pictures the frame skip left out (PS2_FRAMESKIP, gs.cpp)
+// The window's pace, every frame: the game did not get ahead of the clock (it had no time to wait). The frame skip leaves pictures out then.
+void set_running_late(bool late);
+bool frame_skip_on();  // PS2_FRAMESKIP, on by default on Android (gs.cpp)
 // pad 0 is the first controller port, pad 1 the second, which starts unplugged
 void set_pad_buttons(std::uint16_t pressed, int pad = 0);
 void set_pad_axis(int axis, std::uint8_t value, int pad = 0);

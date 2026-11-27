@@ -1479,6 +1479,15 @@ void wait_until(std::uint64_t target) {
 
 void pace() {
     if (no_limit()) return;
+    // The frame skip (gs.cpp) leaves pictures out while the game is late: more than half a frame behind a schedule of 50 (60) frames a
+    // second of the wall clock. Not from the waits below: when the game is slow its sound is stretched, the sound queue stays full and
+    // the game still waits for it. Far behind (a load), the schedule starts again from now.
+    {
+        static std::uint64_t due = 0;
+        const std::uint64_t frequency = SDL_GetPerformanceFrequency(), period = frequency / (ps2::g_options.pal ? 50 : 60), now = SDL_GetPerformanceCounter();
+        due = due && now < due + 4 * period ? due + period : now;
+        ps2::set_running_late(now > due + period / 2);
+    }
     static bool stuck = false;  // the device took no sound for a second; the clock paces the game until it takes some again
     if (g_audio && !audio_paced() && !stuck) {
         g_pipe->frame(audio_seconds());
@@ -1487,8 +1496,11 @@ void pace() {
         const double steer = std::clamp((g_pipe->queued_ms() - kSteerMs) / kSteerMs * 0.02, -0.01, 0.01);
         const auto period = static_cast<std::uint64_t>(frequency / (ps2::g_options.pal ? 50.0 : 60.0) * (1.0 + steer));
         const std::uint64_t now = SDL_GetPerformanceCounter();
-        // more than two frames behind (a load, a hold): start counting again from now rather than rushing to catch up
-        if (g_last && now < g_last + 2 * period) {
+        // more than two frames behind (a load, a hold): start counting again from now rather than rushing to catch up. With the frame
+        // skip six: a picture the graphics chip draws can take two or three frames, and the frames after it, whose pictures are left
+        // out, are quick; they must make up for it, or every drawn picture would cost the game its time for good.
+        const std::uint64_t behind = ps2::frame_skip_on() ? 6 : 2;
+        if (g_last && now < g_last + behind * period) {
             g_last += period;
             wait_until(g_last);
         } else {
@@ -1566,6 +1578,7 @@ double resident_mb() {
 void show_speed() {
     static std::uint64_t start = 0, frames = 0;
     static double cpu_start = 0.0, gpu_start = 0.0;
+    static std::uint64_t skipped_start = 0;
     const std::uint64_t now = SDL_GetPerformanceCounter();
     const int cur_scale = static_cast<int>(ps2::video_scale());
     if (cur_scale != g_scale_now) {
@@ -1576,6 +1589,7 @@ void show_speed() {
         start = now;
         cpu_start = process_cpu_seconds();
         gpu_start = ps2::gpu_busy_ms();
+        skipped_start = ps2::skipped_pictures();
     }
     ++frames;
     const double seconds = static_cast<double>(now - start) / static_cast<double>(SDL_GetPerformanceFrequency());
@@ -1585,7 +1599,11 @@ void show_speed() {
     const double queued = queued_ms();
     char stretched[40] = "";  // "audio 62 ms" is the game's sound waiting; when it is played slower, by how much
     if (g_pipe && g_pipe->tempo() < 0.995) std::snprintf(stretched, sizeof stretched, ", stretched x%.1f", 1.0 / g_pipe->tempo());
-    std::snprintf(title, sizeof title, "ps2-native-recomp  %.1f fps  CPU %.0f%%  GPU %.0f%%  RAM %.0f MB  audio %.0f ms%s", static_cast<double>(frames) / seconds,
+    // the frame skip (gs.cpp): this runs for every picture shown, so the game's frames are those and the ones left out
+    const std::uint64_t skipped = ps2::skipped_pictures() - skipped_start;
+    char shown[32] = "";
+    if (skipped) std::snprintf(shown, sizeof shown, " (%.0f shown)", static_cast<double>(frames) / seconds);
+    std::snprintf(title, sizeof title, "ps2-native-recomp  %.1f fps%s  CPU %.0f%%  GPU %.0f%%  RAM %.0f MB  audio %.0f ms%s", static_cast<double>(frames + skipped) / seconds, shown,
                   (cpu - cpu_start) / seconds * 100.0, (gpu - gpu_start) / (seconds * 10.0), resident_mb(), queued, stretched);
     g_speed_title = title;
     refresh_title();
@@ -1598,6 +1616,7 @@ void show_speed() {
     frames = 0;
     cpu_start = cpu;
     gpu_start = gpu;
+    skipped_start += skipped;
 }
 
 // PS2_PRESENT_LOG=1: once a second, how long the emulation thread waited per frame for the window thread (post_present: the

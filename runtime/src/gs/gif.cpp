@@ -248,8 +248,10 @@ Path g_scan[4];
 // PATH1 with VU1 on its own thread. The emulation thread follows VIF1 dry (vif.cpp) and so sees the SIGNAL, FINISH and LABEL
 // writes of PATH2 (scan_signals), but not those in the packets VU1 programs kick: it does not run the programs. The vector thread
 // looks for them in what it kicks and leaves them here; the emulation thread takes them over after it waited for the vector thread
-// (take_vu_signals), at a point of its own choosing, so a run gives the game the same writes at the same moment every time. Tony
-// Hawk's Pro Skater 4 waits on its loading screen for SIGNAL interrupts from PATH1; without this they never came.
+// (take_vu_signals), at a point of its own choosing, so a run gives the game the same writes at the same moment every time: at a
+// refresh, or sooner when the game waits for them in a loop (system.cpp, take_vu_signals_waiting). Tony Hawk's Pro Skater 4 waits on
+// its loading screen for SIGNAL interrupts from PATH1; without this they never came. In its levels it waits for one at each of about
+// 21 stages of a picture; taken only at the refresh, they made it draw one stage a refresh and show a new picture every 21.
 Path g_vu_scan1;  // the vector thread's own
 std::mutex g_vu_found_mutex;
 std::vector<std::pair<std::uint32_t, std::uint64_t>> g_vu_found;
@@ -459,13 +461,14 @@ void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
 
 void scan_signals(int path, const std::uint8_t *data, std::uint32_t qwc) { scan(g_scan[path], data, qwc); }
 
-void take_vu_signals() {
+bool take_vu_signals() {
     std::vector<std::pair<std::uint32_t, std::uint64_t>> found;
     {
         std::lock_guard<std::mutex> lock(g_vu_found_mutex);
         found.swap(g_vu_found);
     }
     for (const auto &[reg, value] : found) gs::queue_signal(reg, value);
+    return !found.empty();
 }
 
 bool busy(int path) { return g_paths[path].active; }

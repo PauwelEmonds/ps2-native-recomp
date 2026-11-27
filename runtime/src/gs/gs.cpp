@@ -54,6 +54,8 @@ std::uint32_t g_finish_pending = 0;  // FINISH events that arrived while CSR.FIN
 std::deque<std::pair<std::uint32_t, std::uint64_t>> g_signal_queue;  // late SIGNAL, FINISH and LABEL writes (queue_signal)
 std::uint32_t g_finish_queued = 0;   // FINISH writes that came while an earlier one was still on its way; each gets its own event (not in a state)
 std::uint64_t g_primitives = 0;
+// Frame skip (drawing thread): the shapes of this picture are not drawn and it is not shown (render_pending, kPresent).
+bool g_skip_picture = false;
 constexpr std::uint64_t kFinishDelay = 1000; // EE cycles from the FINISH write to CSR.FINISH
 
 #ifdef PS2_GPU
@@ -771,7 +773,7 @@ void transfer(const State &s, std::uint64_t dir) {
         if (!trace::g_any || trace::draw(s, needed)) {
             if (cpu_raster()) raster::draw(s, s.queue, needed);
 #ifdef PS2_GPU
-            if (gpu_on()) gpu::draw(s, s.queue, needed);
+            if (gpu_on() && !g_skip_picture) gpu::draw(s, s.queue, needed);
 #endif
         }
         ++g_primitives;
@@ -1756,7 +1758,7 @@ bool copy_frame(const DisplayRegs &r, std::vector<std::uint32_t> &rgba, std::uin
 }
 
 std::atomic<std::uint32_t> g_presented{0};
-std::uint32_t g_posted_presents = 0;
+std::atomic<std::uint32_t> g_posted_presents{0};
 
 void flush_and_wait() {
 #ifdef PS2_GPU
@@ -1779,9 +1781,51 @@ std::uint32_t present_frame() { return g_present_frame; }
 void post_present() {
     const DisplayRegs regs = display_regs();
     queue::post(queue::kPresent, static_cast<std::uint32_t>(frame_count()), 0, &regs, sizeof regs);
-    ++g_posted_presents;
-    for (std::uint32_t done = g_presented.load(); g_posted_presents - done > 2; done = g_presented.load()) queue::wait(g_presented, done);
+    const std::uint32_t posted = g_posted_presents.fetch_add(1, std::memory_order_relaxed) + 1;
+    for (std::uint32_t done = g_presented.load(); posted - done > 2; done = g_presented.load()) queue::wait(g_presented, done);
 }
+
+// Frame skip: a game whose pictures the graphics chip cannot draw in time (THPS4 on a Mali-G68: about 50 ms of the chip a picture)
+// would otherwise run that much slower, its sound stretched. When the emulation is not ahead of the clock (the window's pace found no
+// time to wait, set_running_late) or has already handed over the next picture by the time this one is shown, that next picture is
+// not drawn (its shapes are left out; uploads, copies, palettes and read-backs still run, so the graphics memory the game reads stays
+// right) and not shown, at most kMaxSkipped in a row. The game itself runs as before, at full speed; only fewer of its pictures reach the screen. An effect that a game draws
+// into a texture in one picture and uses in a later one shows that texture from an earlier drawn picture. On by default on Android
+// (a phone's graphics chip is the usual limit there), off elsewhere; PS2_FRAMESKIP=1 or 0 sets it.
+constexpr std::uint32_t kMaxSkipped = 3;
+std::uint32_t g_skipped_in_row = 0;
+std::atomic<std::uint64_t> g_skipped_pictures{0};
+std::atomic<bool> g_running_late{false};
+
+void set_running_late(bool late) { g_running_late.store(late, std::memory_order_relaxed); }
+
+bool frameskip_on() {
+    static const bool on = [] {
+        const std::string v = os::env("PS2_FRAMESKIP");
+#ifdef __ANDROID__
+        const bool on = v != "0";
+#else
+        const bool on = !v.empty() && v != "0";
+#endif
+        if (on) std::fprintf(stderr, "[gpu] frame skip on: a picture the graphics chip has no time for is left out (PS2_FRAMESKIP=0 turns it off)\n");
+        return on;
+    }();
+    return on;
+}
+
+bool skip_next_picture() {
+    if (!frameskip_on() || !gpu_on() || cpu_raster()) return false;
+    const std::uint32_t shown = g_presented.load() + 1;  // this one counts as shown once render_pending pops it
+    const bool behind = g_running_late.load(std::memory_order_relaxed) || static_cast<std::int32_t>(g_posted_presents.load(std::memory_order_relaxed) - shown) > 0;
+    if (!behind || g_skipped_in_row >= kMaxSkipped) {
+        g_skipped_in_row = 0;
+        return false;
+    }
+    ++g_skipped_in_row;
+    return true;
+}
+
+std::uint64_t skipped_pictures() { return g_skipped_pictures.load(std::memory_order_relaxed); }
 
 Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_present, double budget_ms) {
     queue::role() = queue::Role::Render;
@@ -1821,7 +1865,9 @@ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_prese
             DisplayRegs regs;
             std::memcpy(&regs, payload, sizeof regs);
             g_present_frame = h.arg0;
-            on_present(regs);
+            if (!g_skip_picture) on_present(regs);
+            else ++g_skipped_pictures;
+            g_skip_picture = skip_next_picture();
             presented = true;
             break;
         }

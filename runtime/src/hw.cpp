@@ -267,6 +267,10 @@ void spin_watch(std::uint32_t value) {
         return;
     }
     if (w.streak < kSpinAfter + 2) return;  // three reads in a row looked the same
+    if (take_vu_signals_waiting()) {  // what VU1 kicked may hold what the loop waits for (system.hpp): look again from here
+        w.streak = 0;
+        return;
+    }
     const std::int64_t left = g_cpu.budget;
     const std::uint64_t step = 4u * delta;
     if (delta == 0 || left <= static_cast<std::int64_t>(step) + 1) return;
@@ -367,6 +371,11 @@ void spin_turn(Cpu &c, std::uint32_t pc, std::uint32_t written) {
     if (w.turns == 0 || delta != w.delta) {  // the same registers once, or a turn of another length: count from here
         w.delta = delta;
         w.turns = 1;
+        return;
+    }
+    if (take_vu_signals_waiting()) {  // what VU1 kicked may hold what the loop waits for (system.hpp)
+        ++g_event_seq;  // an interrupt may be due: the next turn is a first one again
+        if (c.budget > 0) set_budget(c, 0);  // and it is taken at the loop's next look at the budget
         return;
     }
     const std::int64_t left = c.budget;

@@ -301,8 +301,91 @@ fn cache_bits_at(offset: u32, bit: u32, count: u32) -> u32 {
 // value through the same write as before; only which thread does it changes. The squares make the threads that run side by side write
 // neighbouring places of graphics memory (a 32-bit texture's 8 x 8 block is 256 bytes in a row), and the search for the record and the
 // division of a pixel's number by the row width are done once per square instead of once per pixel.
+var<workgroup> up_value: array<atomic<u32>, 64>;
+var<workgroup> up_mask: array<atomic<u32>, 64>;
+
+// prm(3) = 2 (gpu.cpp emit_pre, at scale 1): each workgroup takes one 256-byte block of graphics memory that a record writes, in the
+// record's format (8 x 8 pixels of 32 bits, 16 x 8 of 16, 16 x 16 of 8, 32 x 16 of 4; word 15 of the record holds that width and,
+// shifted by 16, that height; words 11 to 14 as with prm(3) = 1, counted in these blocks). The threads gather the block's pixels into
+// its 64 words in workgroup memory and then write each word once: whole, or only the bits the record covers. The pixel-by-pixel way
+// changes graphics memory with an atomic read and change for every pixel of fewer than 32 bits, 8 of them for one word of a 4-bit
+// texture; on a Mali-G68 THPS4's uploads (5 million pixels a picture) took 15 ms that way, two thirds of it in those writes. Each word
+// gets the same bits as before. The records of one command never write the same bits (emit_pre keeps uploads that share a block in
+// separate commands, unless they are the same place's disjoint rectangles or parts of one image), so a word's covered bits are this
+// workgroup's alone, and the bits it leaves alone keep whatever another workgroup writes there.
+fn upload_blocks(wid: vec3<u32>, lid: u32) {
+    let g = wid.x + wid.y * 1024u;
+    let inside = g < prm(2u);
+    atomicStore(&up_value[lid], 0u);
+    atomicStore(&up_mask[lid], 0u);
+    workgroupBarrier();
+    var base = 0u;
+    if (inside) {
+        let records = prm(0u);
+        var lo = 0u;
+        var hi = prm(1u);
+        while (hi - lo > 1u) {
+            let mid = (lo + hi) / 2u;
+            if (data[records + mid * 16u + 11u] <= g) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let r = records + lo * 16u;
+        let psm = data[r + 2u];
+        let wide = data[r + 15u] & 0xFFFFu;
+        let high = data[r + 15u] >> 16u;
+        let b = g - data[r + 11u];
+        let across = data[r + 14u];
+        let row = b / across;
+        let bx = (data[r + 12u] + b - row * across) * wide;
+        let by = (data[r + 13u] + row) * high;
+        base = locate(psm, data[r], data[r + 1u], bx & 0x7FFu, by & 0x7FFu).word & ~63u;
+        let rrw = data[r + 5u];
+        let bpp = data[r + 10u] & 0xFFu;
+        let cached = (data[r + 10u] & 0x80000000u) != 0u;
+        for (var i = lid; i < wide * high; i = i + 64u) {
+            let ux = bx + i % wide;
+            let uy = by + i / wide;
+            let dx = ux - data[r + 3u];
+            let dy = uy - data[r + 4u];
+            let k = dy * rrw + dx - data[r + 6u];
+            if (dx < rrw && dy <= 0x7FFu && k < data[r + 7u]) {
+                var v = 0u;
+                if (cached) {
+                    v = cache_bits_at(data[r + 8u], data[r + 9u] + k * bpp, bpp);
+                } else {
+                    v = bits_at(data[r + 8u], data[r + 9u] + k * bpp, bpp);
+                }
+                let l = locate(psm, data[r], data[r + 1u], ux & 0x7FFu, uy & 0x7FFu);
+                atomicOr(&up_value[l.word & 63u], (v & l.mask) << l.shift);
+                atomicOr(&up_mask[l.word & 63u], l.mask << l.shift);
+            }
+        }
+    }
+    workgroupBarrier();
+    let m = atomicLoad(&up_mask[lid]);
+    if (inside && m != 0u) {
+        let w = base + lid;
+        let value = atomicLoad(&up_value[lid]);
+        if (m == 0xFFFFFFFFu) {
+            atomicStore(&vram[w], value);
+        } else {
+            let flip = (atomicLoad(&vram[w]) ^ value) & m;
+            if (flip != 0u) {
+                atomicXor(&vram[w], flip);
+            }
+        }
+    }
+}
+
 @compute @workgroup_size(64)
 fn upload(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    if (prm(3u) == 2u) {
+        upload_blocks(wid, lid);
+        return;
+    }
     let records = prm(0u);
     var r = 0u;
     var k = 0u;

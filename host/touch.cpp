@@ -4,6 +4,7 @@
 #include "touch.hpp"
 
 #include "ps2/os.hpp"
+#include "ps2/system.hpp"
 
 #include "../runtime/src/gs/gpu/overlay.hpp"
 
@@ -86,27 +87,30 @@ struct Finger {
 float g_stick_ox = 0, g_stick_oy = 0, g_stick_x = 0, g_stick_y = 0;  // pixels: where the thumb landed, where it is
 bool g_stick_on = false;
 unsigned g_pressed = 0;  // bit per button
-// A button stays down at least kMinHoldMs after it went down: a quick tap can be shorter than a frame, and a game does not read
-// the pad every frame everywhere (THPS4's menus missed presses of 150 ms on the phone and took those of 200 ms). g_down_at: when
-// each button went down; g_held: let go but still held until g_down_at + kMinHoldMs.
-constexpr Uint32 kMinHoldMs = 200;
-Uint32 g_down_at[16] = {};
+// A button stays down for at least kMinHoldFrames frames of the game after it went down: a quick tap can be shorter than a frame,
+// and the game takes the pad over only at a frame boundary. Counted in the game's frames, not in milliseconds, so that a tap
+// still reaches it when it runs slower than real time. Not longer: THPS4 reads the pad every frame (a press of one frame moves
+// its menus), repeats a held direction after a few frames (a hold of 200 ms moved a menu up to four entries), and ollies when
+// cross is let go, so every frame held too long is a frame the ollie comes late. g_down_at: the frame each button went down;
+// g_held: let go but still held until g_down_at + kMinHoldFrames.
+constexpr std::uint64_t kMinHoldFrames = 2;
+std::uint64_t g_down_at[16] = {};
 unsigned g_held = 0;
 
 void press(int b) {
     g_pressed |= 1u << b;
     g_held &= ~(1u << b);
-    g_down_at[b] = SDL_GetTicks();
+    g_down_at[b] = ps2::frames_run();
 }
 void let_go(int b) {
     g_pressed &= ~(1u << b);
-    if (SDL_GetTicks() - g_down_at[b] < kMinHoldMs) g_held |= 1u << b;
+    if (ps2::frames_run() - g_down_at[b] < kMinHoldFrames) g_held |= 1u << b;
 }
 // the buttons down now: pressed, or let go too soon
 unsigned down_now() {
-    const Uint32 now = SDL_GetTicks();
+    const std::uint64_t now = ps2::frames_run();
     for (int b = 0; b < 16; ++b)
-        if ((g_held & (1u << b)) && now - g_down_at[b] >= kMinHoldMs) g_held &= ~(1u << b);
+        if ((g_held & (1u << b)) && now - g_down_at[b] >= kMinHoldFrames) g_held &= ~(1u << b);
     return g_pressed | g_held;
 }
 Uint32 g_last_touch = 0, g_last_pad = 0;
